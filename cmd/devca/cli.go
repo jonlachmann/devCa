@@ -62,17 +62,51 @@ func (c *client) do(method, path string, in, out any) error {
 	return nil
 }
 
+// upsert creates a service, or updates an existing one of the same mode.
+// Options not given on the command line keep their current values, and a
+// service in another mode is never converted behind the user's back.
+func (c *client) upsert(host string, body map[string]any) (svcView, error) {
+	var v svcView
+	err := c.do("POST", "/api/services", body, &v)
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		return v, err
+	}
+	var list []svcView
+	if err := c.do("GET", "/api/services", nil, &list); err != nil {
+		return v, err
+	}
+	for _, cur := range list {
+		if !strings.EqualFold(cur.Hostname, host) {
+			continue
+		}
+		if cur.Mode != body["mode"] {
+			return v, fmt.Errorf("%s is already a %s service; change its mode in the web UI or remove it first", host, cur.Mode)
+		}
+		if body["exportDir"] == "" {
+			body["exportDir"] = cur.ExportDir
+		}
+		if body["validationPort"] == 0 {
+			body["validationPort"] = cur.ValidationPort
+		}
+	}
+	err = c.do("PUT", "/api/services/"+host, body, &v)
+	return v, err
+}
+
 func table() *tabwriter.Writer { return tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0) }
 
 type svcView struct {
-	Hostname string
-	Mode     string
-	Target   string
-	Enabled  bool
-	URL      string
-	CertDir  string
-	Resolves string
-	Cert     *struct {
+	Hostname       string
+	Address        string
+	ExportDir      string
+	ValidationPort int
+	Mode           string
+	Target         string
+	Enabled        bool
+	URL            string
+	CertDir        string
+	Resolves       string
+	Cert           *struct {
 		ID       int64
 		Status   string
 		NotAfter time.Time
@@ -242,6 +276,7 @@ func cmdCertList(args []string) error {
 func cmdCertIssue(args []string) error {
 	fs, data := flags("cert issue")
 	out := fs.String("out", "", "also write the files to this directory (kept up to date on renewal)")
+	addr := fs.String("address", "", "loopback address for the hosts file, e.g. 127.0.0.2 (to share a port with another service)")
 	pos := parse(fs, args)
 	if err := need(pos, 1, "cert issue <host> [--out dir]"); err != nil {
 		return err
@@ -255,15 +290,17 @@ func cmdCertIssue(args []string) error {
 	}
 	c := newClient(*data)
 	body := map[string]any{"hostname": pos[0], "mode": "export", "exportDir": dir}
-	var v svcView
-	err := c.do("POST", "/api/services", body, &v)
-	if err != nil && strings.Contains(err.Error(), "already exists") {
-		err = c.do("PUT", "/api/services/"+pos[0], body, &v)
+	if *addr != "" {
+		body["address"] = *addr
 	}
+	v, err := c.upsert(pos[0], body)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("Certificate for %s, renewed automatically:\n", v.Hostname)
+	if v.Address != "" {
+		fmt.Printf("Hosts entry: %s %s (bind your app to that address)\n", v.Address, v.Hostname)
+	}
 	for _, d := range []string{v.CertDir, dir} {
 		if d == "" {
 			continue
@@ -303,7 +340,7 @@ func cmdCertRevoke(args []string) error {
 			return err
 		}
 		for _, v := range list {
-			if v.Hostname == pos[0] && v.Cert != nil {
+			if strings.EqualFold(v.Hostname, pos[0]) && v.Cert != nil {
 				id = v.Cert.ID
 			}
 		}
@@ -328,7 +365,7 @@ func cmdCertExport(args []string) error {
 	if *out == "" {
 		return errors.New("--out is required")
 	}
-	src := filepath.Join(*data, "certs", pos[0])
+	src := filepath.Join(*data, "certs", strings.ToLower(pos[0]))
 	for _, f := range []string{certs.FileCert, certs.FileKey, certs.FileBundle, certs.FileCA} {
 		b, err := os.ReadFile(filepath.Join(src, f))
 		if err != nil {
@@ -386,17 +423,17 @@ func cmdACMEInfo(args []string) error {
 func cmdACMEClaim(args []string) error {
 	fs, data := flags("acme claim")
 	port := fs.Int("port", 0, "port where your ACME client serves HTTP-01 (if DevCA's gateway holds port 80)")
+	addr := fs.String("address", "", "loopback address for the hosts file and HTTP-01 validation, e.g. 127.0.0.2")
 	pos := parse(fs, args)
 	if err := need(pos, 1, "acme claim <host> [--port n]"); err != nil {
 		return err
 	}
 	c := newClient(*data)
 	body := map[string]any{"hostname": pos[0], "mode": "acme", "validationPort": *port}
-	err := c.do("POST", "/api/services", body, nil)
-	if err != nil && strings.Contains(err.Error(), "already exists") {
-		err = c.do("PUT", "/api/services/"+pos[0], body, nil)
+	if *addr != "" {
+		body["address"] = *addr
 	}
-	if err != nil {
+	if _, err := c.upsert(pos[0], body); err != nil {
 		return err
 	}
 	fmt.Printf("%s is reserved for an external ACME client. DevCA will not issue or renew it itself.\n", pos[0])

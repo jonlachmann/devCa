@@ -107,7 +107,12 @@ func (e *env) client(t *testing.T) *xacme.Client {
 
 func TestSelfTest(t *testing.T) {
 	e := newEnv(t)
-	e.acmeService(t, "api.localhost")
+	e.srv.GatewayHTTPPort = e.chalPort // the responder plays DevCA's gateway
+	// A validation port on the service must not divert the self-test.
+	_ = e.srv.Store.Update(func(s *store.State) error {
+		s.Services = append(s.Services, &store.Service{Hostname: "api.localhost", Mode: store.ModeACME, Enabled: true, ValidationPort: 1})
+		return nil
+	})
 	st := &SelfTest{
 		Server: e.srv, DirectoryURL: e.acmeURL + "/directory", Roots: e.roots,
 		KeyPath: filepath.Join(e.dir, "acme-test.key"),
@@ -134,19 +139,22 @@ func TestExternalClientFlow(t *testing.T) {
 	if _, err := cl.Register(ctx, &xacme.Account{Contact: []string{"mailto:dev@example.com"}}, xacme.AcceptTOS); err != nil {
 		t.Fatal(err)
 	}
-	// An unowned host is auto-claimed in acme mode; point validation at the responder.
+	// Orders alone don't claim hostnames (otherwise a client looping
+	// new-order could grow the state without bound).
+	if _, err := cl.AuthorizeOrder(ctx, xacme.DomainIDs("unclaimed.local")); err != nil {
+		t.Fatal(err)
+	}
+	e.srv.Store.View(func(s *store.State) {
+		if s.Service("unclaimed.local") != nil {
+			t.Fatal("order claimed a hostname before issuance")
+		}
+	})
+
+	e.acmeService(t, "web.local")
 	o, err := cl.AuthorizeOrder(ctx, xacme.DomainIDs("web.local"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = e.srv.Store.Update(func(s *store.State) error {
-		svc := s.Service("web.local")
-		if svc == nil || svc.Mode != store.ModeACME {
-			t.Fatal("host not auto-claimed")
-		}
-		svc.ValidationPort = e.chalPort
-		return nil
-	})
 	az, _ := cl.GetAuthorization(ctx, o.AuthzURLs[0])
 	ch := az.Challenges[0]
 
@@ -185,6 +193,10 @@ func TestExternalClientFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A second finalize of the same order must not issue again.
+	if _, _, err := cl.CreateOrderCert(ctx, o.FinalizeURL, csr, false); err == nil || !strings.Contains(err.Error(), "orderNotReady") {
+		t.Fatalf("second finalize: %v", err)
+	}
 	leaf, _ := x509.ParseCertificate(der[0])
 	if _, err := leaf.Verify(x509.VerifyOptions{DNSName: "web.local", Roots: e.roots}); err != nil {
 		t.Fatal(err)
@@ -200,6 +212,17 @@ func TestExternalClientFlow(t *testing.T) {
 	old.Key = oldKey
 	if _, err := old.GetReg(ctx, ""); err == nil {
 		t.Fatal("old key still valid after rollover")
+	}
+
+	// A forged certificate that copies the serial, signed with the forger's own
+	// key, must not revoke the real one.
+	forgerKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	forged, _ := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: leaf.SerialNumber, NotBefore: leaf.NotBefore, NotAfter: leaf.NotAfter, DNSNames: leaf.DNSNames,
+	}, &x509.Certificate{SerialNumber: leaf.SerialNumber}, forgerKey.Public(), forgerKey)
+	forger := e.client(t)
+	if err := forger.RevokeCert(ctx, forgerKey, forged, xacme.CRLReasonUnspecified); err == nil {
+		t.Fatal("forged certificate revoked the real one")
 	}
 
 	// Revoke with the certificate key (jwk-signed).
@@ -307,5 +330,21 @@ func TestJWSRejections(t *testing.T) {
 		if code, body := post(c.body); code < 400 || !strings.Contains(body, c.want) {
 			t.Errorf("%s: got %d %s, want %s", c.name, code, body, c.want)
 		}
+	}
+}
+
+// A service's configured address wins over name resolution.
+func TestValidatorPin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "tok.ka") }))
+	defer srv.Close()
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+	v := &Validator{Resolve: func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("10.9.9.9")}, nil // would be rejected
+	}}
+	if p := v.HTTP01(context.Background(), "a.localhost", "", port, "tok", "tok.ka"); p == nil {
+		t.Fatal("non-loopback resolution accepted")
+	}
+	if p := v.HTTP01(context.Background(), "a.localhost", "127.0.0.1", port, "tok", "tok.ka"); p != nil {
+		t.Fatalf("pinned validation failed: %s", p.Detail)
 	}
 }

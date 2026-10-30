@@ -52,9 +52,12 @@ func openData(dir string) (*store.Store, error) {
 
 func cmdServe(args []string) error {
 	fs, data := flags("serve")
-	background := fs.Bool("background", false, "detach from the console and log to devca.log (used by the Windows logon task)")
+	background := fs.Bool("background", false, "detach from the console and log to devca.log (used by the Windows startup entry)")
 	parse(fs, args)
-	dir := *data
+	dir, err := filepath.Abs(*data)
+	if err != nil {
+		return err
+	}
 
 	if *background {
 		platform.DetachConsole()
@@ -85,6 +88,7 @@ func cmdServe(args []string) error {
 	gw := &gateway.Gateway{Store: st, Certs: mgr, HTTPSPort: settings.HTTPSPort}
 	mgr.OnChange = gw.Reload
 	acmeSrv := &acme.Server{Store: st, Certs: mgr, Validator: &acme.Validator{}, GatewayHTTPPort: settings.HTTPPort}
+	acmeSrv.Recover()
 	acmeCert := &selfCert{ca: root}
 
 	a := &api.API{
@@ -92,6 +96,7 @@ func cmdServe(args []string) error {
 		MgmtPort: settings.MgmtPort, ACMEPort: settings.ACMEPort,
 		HTTPPort: settings.HTTPPort, HTTPSPort: settings.HTTPSPort,
 		ACMELeaf: acmeCert.leaf,
+		Running:  settings,
 		SelfTest: &acme.SelfTest{
 			Server:       acmeSrv,
 			DirectoryURL: fmt.Sprintf("https://localhost:%d/acme/directory", settings.ACMEPort),
@@ -167,8 +172,8 @@ func listenLoopback(srv *http.Server, port int, useTLS, required bool) error {
 }
 
 // selfCert is the ACME listener's own certificate (localhost + loopback IPs).
-// ponytail: issued straight from the CA and not recorded as a managed cert;
-// it is regenerated in memory whenever it gets within 10 days of expiry.
+// It is issued straight from the CA and not recorded as a managed cert, and is
+// regenerated in memory whenever it gets within 10 days of expiry.
 type selfCert struct {
 	ca   *ca.CA
 	mu   sync.Mutex

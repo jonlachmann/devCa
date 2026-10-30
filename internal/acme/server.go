@@ -4,11 +4,13 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jonlachmann/devca/internal/ca"
 	"github.com/jonlachmann/devca/internal/certs"
 	"github.com/jonlachmann/devca/internal/store"
 )
@@ -125,6 +128,35 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Add("Link", fmt.Sprintf(`<%s/directory>;rel="index"`, baseURL(r)))
 		mux.ServeHTTP(w, r)
+	})
+}
+
+// Recover fails work that a restart interrupted. Validations and issuance run
+// in memory, so anything left "processing" would otherwise hang until the
+// order expires; failing it lets the client retry with a new order.
+func (s *Server) Recover() {
+	_ = s.Store.Update(func(st *store.State) error {
+		restarted := &store.Problem{Type: errServerInternal, Detail: "DevCA restarted during this step; please retry"}
+		failed := map[int64]bool{}
+		for _, a := range st.Authzs {
+			for _, c := range a.Challenges {
+				if c.Status == "processing" {
+					c.Status, c.Error = "invalid", restarted
+					a.Status = "invalid"
+					failed[a.ID] = true
+				}
+			}
+		}
+		for _, o := range st.Orders {
+			stuck := o.Status == "processing"
+			if o.Status == "pending" {
+				stuck = slices.ContainsFunc(o.AuthzIDs, func(id int64) bool { return failed[id] })
+			}
+			if stuck {
+				o.Status, o.Error = "invalid", restarted
+			}
+		}
+		return nil
 	})
 }
 
@@ -363,10 +395,8 @@ func (s *Server) newAccount(req *request) (int, any, *problem) {
 	if pr := req.decode(&p); pr != nil {
 		return 0, nil, pr
 	}
-	for _, c := range p.Contact {
-		if !strings.HasPrefix(c, "mailto:") || len(c) > 254 || strings.ContainsAny(c, ",") {
-			return 0, nil, prob(400, errUnsupportedContact, "only single mailto: contacts are supported")
-		}
+	if pr := checkContacts(p.Contact); pr != nil {
+		return 0, nil, pr
 	}
 	var acct store.Account
 	status := http.StatusOK
@@ -403,6 +433,18 @@ func asProblem(err error) *problem {
 	return prob(500, errServerInternal, "%v", err)
 }
 
+func checkContacts(contacts []string) *problem {
+	if len(contacts) > 10 {
+		return prob(400, errUnsupportedContact, "at most 10 contacts")
+	}
+	for _, c := range contacts {
+		if !strings.HasPrefix(c, "mailto:") || len(c) > 254 || strings.ContainsAny(c, ",") {
+			return prob(400, errUnsupportedContact, "only single mailto: contacts are supported")
+		}
+	}
+	return nil
+}
+
 func (s *Server) account(req *request) (int, any, *problem) {
 	id, p := req.pathID()
 	if p != nil {
@@ -420,6 +462,11 @@ func (s *Server) account(req *request) (int, any, *problem) {
 	}
 	if p := req.decode(&upd); p != nil {
 		return 0, nil, p
+	}
+	if upd.Contact != nil {
+		if pr := checkContacts(*upd.Contact); pr != nil {
+			return 0, nil, pr
+		}
 	}
 	if upd.Status != "" && upd.Status != "deactivated" && upd.Status != "valid" {
 		return 0, nil, prob(400, errMalformed, "status may only be set to deactivated")
@@ -563,10 +610,6 @@ func (s *Server) newOrder(req *request) (int, any, *problem) {
 		order := &store.Order{ID: st.ID(), AccountID: req.acct.ID, Status: "pending",
 			Expires: now.Add(orderLifetime), Identifiers: idents, Created: now}
 		for _, id := range idents {
-			if st.Service(id.Value) == nil && !req.acct.Internal {
-				st.Services = append(st.Services, &store.Service{Hostname: id.Value, Mode: store.ModeACME, Enabled: true, Created: now})
-				st.Log("info", "service", "%s claimed by ACME account %d", id.Value, req.acct.ID)
-			}
 			a := &store.Authz{ID: st.ID(), AccountID: req.acct.ID, Identifier: id, Status: "pending", Expires: order.Expires,
 				Challenges: []*store.Challenge{{ID: st.ID(), Type: "http-01", Token: token(), Status: "pending"}}}
 			st.Authzs = append(st.Authzs, a)
@@ -671,29 +714,66 @@ func (s *Server) finalize(req *request) (int, any, *problem) {
 		return 0, nil, prob(400, errBadCSR, "certificate key must differ from the account key")
 	}
 
+	if err := ca.CheckKey(csr.PublicKey); err != nil {
+		return 0, nil, prob(400, errBadPublicKey, "%v", err)
+	}
+
 	owner := store.OwnerACME(req.acct.ID)
 	if req.acct.Internal {
 		owner = store.OwnerTest
 	}
-	_ = s.Store.Update(func(st *store.State) error { st.Order(o.ID).Status = "processing"; return nil })
-	c, err := s.Certs.Issue(want, csr.PublicKey, owner)
-	err2 := s.Store.Update(func(st *store.State) error {
+	// ready -> processing atomically, so concurrent finalizes can't both issue.
+	// Authorizations are re-checked in case one was deactivated after "ready",
+	// and ownership in case a DevCA-managed service took a name meanwhile.
+	err = s.Store.Update(func(st *store.State) error {
 		x := st.Order(o.ID)
-		if err != nil {
+		if x.Status != "ready" {
+			return prob(403, errOrderNotReady, "order is %s, not ready", x.Status)
+		}
+		for _, id := range x.AuthzIDs {
+			if a := st.Authz(id); a == nil || a.Status != "valid" {
+				return prob(403, errOrderNotReady, "an authorization is no longer valid")
+			}
+		}
+		if !req.acct.Internal {
+			for _, w := range want {
+				if svc := st.Service(w); svc != nil && svc.Mode != store.ModeACME {
+					return prob(403, errUnauthorized, "%s is now managed by DevCA (%s mode)", w, svc.Mode)
+				}
+			}
+		}
+		x.Status = "processing"
+		return nil
+	})
+	if err != nil {
+		return 0, nil, asProblem(err)
+	}
+	c, issueErr := s.Certs.Issue(want, csr.PublicKey, owner)
+	err = s.Store.Update(func(st *store.State) error {
+		x := st.Order(o.ID)
+		if issueErr != nil {
 			x.Status = "invalid"
-			x.Error = &store.Problem{Type: errBadCSR, Detail: err.Error()}
-			st.Log("error", "acme", "Order %d failed: %v", o.ID, err)
+			x.Error = &store.Problem{Type: errServerInternal, Detail: issueErr.Error()}
+			st.Log("error", "acme", "Order %d failed: %v", o.ID, issueErr)
 		} else {
 			x.Status, x.CertID = "valid", c.ID
+			// An unowned hostname becomes owned by external ACME clients once
+			// something is actually issued for it.
+			for _, w := range want {
+				if st.Service(w) == nil && !req.acct.Internal {
+					st.Services = append(st.Services, &store.Service{Hostname: w, Mode: store.ModeACME, Enabled: true, Created: time.Now()})
+					st.Log("info", "service", "%s claimed by ACME account %d", w, req.acct.ID)
+				}
+			}
 		}
 		*o = *x
 		return nil
 	})
-	if err != nil {
-		return 0, nil, prob(400, errBadPublicKey, "%v", err)
+	if issueErr != nil {
+		return 0, nil, prob(500, errServerInternal, "issuing failed: %v", issueErr)
 	}
-	if err2 != nil {
-		return 0, nil, asProblem(err2)
+	if err != nil {
+		return 0, nil, asProblem(err)
 	}
 	setLocation(req, fmt.Sprintf("%s/order/%d", req.base, o.ID))
 	return 200, orderJSON(req.base, o), nil
@@ -757,6 +837,7 @@ func (s *Server) challenge(req *request) (int, any, *problem) {
 	var az *store.Authz
 	var ch *store.Challenge
 	var port int
+	var pin string
 	start := false
 	_ = s.Store.Update(func(st *store.State) error {
 		for _, a := range st.Authzs {
@@ -773,12 +854,17 @@ func (s *Server) challenge(req *request) (int, any, *problem) {
 							ch = cc
 						}
 					}
+					// The self-test publishes on DevCA's own gateway, so it never
+					// uses a service's validation port or address.
 					port = 80
 					if req.acct.Internal && s.GatewayHTTPPort != 0 {
 						port = s.GatewayHTTPPort
 					}
-					if svc := st.Service(a.Identifier.Value); svc != nil && svc.Mode == store.ModeACME && svc.ValidationPort != 0 {
-						port = svc.ValidationPort
+					if svc := st.Service(a.Identifier.Value); svc != nil && svc.Mode == store.ModeACME && !req.acct.Internal {
+						if svc.ValidationPort != 0 {
+							port = svc.ValidationPort
+						}
+						pin = svc.Address
 					}
 				}
 			}
@@ -793,7 +879,7 @@ func (s *Server) challenge(req *request) (int, any, *problem) {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.validate(az.ID, ch.ID, az.Identifier.Value, port, ch.Token, keyAuth)
+			s.validate(az.ID, ch.ID, az.Identifier.Value, pin, port, ch.Token, keyAuth)
 		}()
 	}
 	w := challJSON(req.base, ch)
@@ -801,12 +887,12 @@ func (s *Server) challenge(req *request) (int, any, *problem) {
 	return 200, w, nil
 }
 
-func (s *Server) validate(authzID, challID int64, host string, port int, tok, keyAuth string) {
-	pr := s.Validator.HTTP01(context.Background(), host, port, tok, keyAuth)
+func (s *Server) validate(authzID, challID int64, host, pin string, port int, tok, keyAuth string) {
+	pr := s.Validator.HTTP01(context.Background(), host, pin, port, tok, keyAuth)
 	_ = s.Store.Update(func(st *store.State) error {
 		a := st.Authz(authzID)
-		if a == nil {
-			return nil
+		if a == nil || a.Status != "pending" {
+			return nil // deactivated or expired while validating
 		}
 		for _, c := range a.Challenges {
 			if c.ID != challID {
@@ -903,7 +989,12 @@ func (s *Server) revokeCert(req *request) (int, any, *problem) {
 			}
 		}
 	})
+	// Match the exact certificate, not just its serial: anyone can mint a
+	// self-signed certificate with a copied serial and their own key.
 	if target == nil {
+		return 0, nil, prob(404, errMalformed, "certificate was not issued by DevCA")
+	}
+	if blk, _ := pem.Decode([]byte(target.PEM)); blk == nil || !bytes.Equal(blk.Bytes, der) {
 		return 0, nil, prob(404, errMalformed, "certificate was not issued by DevCA")
 	}
 	authorized := false
@@ -926,7 +1017,7 @@ func (s *Server) revokeCert(req *request) (int, any, *problem) {
 
 // ---- nonces ----
 
-// ponytail: in-memory, capped FIFO. A restart invalidates nonces; clients
+// nonceSet is an in-memory, capped FIFO. A restart invalidates nonces; clients
 // retry on badNonce as RFC 8555 intends.
 type nonceSet struct {
 	mu    sync.Mutex

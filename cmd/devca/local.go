@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -35,7 +36,10 @@ func cmdInstall(args []string) error {
 	fs, data := flags("install")
 	yes := fs.Bool("yes", false, "answer yes to all questions")
 	parse(fs, args)
-	dir := *data
+	dir, err := filepath.Abs(*data) // the service runs from another working directory
+	if err != nil {
+		return err
+	}
 
 	st, err := openData(dir)
 	if err != nil {
@@ -74,12 +78,26 @@ func cmdInstall(args []string) error {
 		exe, _ = filepath.EvalSymlinks(exe)
 	}
 	if err != nil || strings.Contains(exe, "go-build") {
-		fmt.Println("Not installing a background service: run `devca install` from the built binary, not `go run`.")
+		fmt.Println("Not installing the program or a background service: run `devca install` from the built binary, not `go run`.")
 		return nil
 	}
+	bin, copied, err := installBinary(exe)
+	if err != nil {
+		return fmt.Errorf("install program to %s: %w", bin, err)
+	}
+	if copied {
+		fmt.Println("✓ Installed the devca command to", bin)
+	} else {
+		fmt.Println("✓ The devca command is installed at", bin)
+	}
+	if !onPath(filepath.Dir(bin)) {
+		fmt.Printf("  %s is not on your PATH yet. %s\n", filepath.Dir(bin), pathHint(filepath.Dir(bin)))
+	}
+	fmt.Println()
+
 	fmt.Printf("DevCA can start automatically when you log in, as %s.\n", platform.ServiceDescription())
 	if *yes || confirm("Run DevCA in the background?", true) {
-		if err := platform.ServiceInstall(exe, dir); err != nil {
+		if err := platform.ServiceInstall(bin, dir); err != nil {
 			return fmt.Errorf("background service: %w (you can still run `devca serve` manually)", err)
 		}
 		fmt.Println("✓ DevCA is running in the background")
@@ -104,8 +122,58 @@ Kept, so nothing breaks unexpectedly:
   - your CA, certificates and settings in %s
   - the root certificate in the system trust store  (remove: devca trust uninstall)
   - DevCA's hosts-file entries                      (remove: devca hosts remove)
-`, *data)
+  - the devca command itself                        (delete %s)
+`, *data, platform.BinPath())
 	return nil
+}
+
+// installBinary copies the running program to platform.BinPath() so the
+// service and the shell use a stable path. If that path already resolves to
+// this binary (e.g. a symlink to a dev build), nothing is copied.
+func installBinary(exe string) (dst string, copied bool, err error) {
+	dst = platform.BinPath()
+	if cur, err := filepath.EvalSymlinks(dst); err == nil {
+		a, err1 := os.Stat(cur)
+		b, err2 := os.Stat(exe)
+		if err1 == nil && err2 == nil && os.SameFile(a, b) {
+			return dst, false, nil
+		}
+	}
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		return dst, false, err
+	}
+	if runtime.GOOS == "windows" {
+		// A running .exe can't be overwritten, but it can be renamed.
+		_ = os.Remove(dst + ".old")
+		_ = os.Rename(dst, dst+".old")
+	}
+	return dst, true, store.WriteFileAtomic(dst, data, 0o755)
+}
+
+func onPath(dir string) bool {
+	for _, p := range filepath.SplitList(os.Getenv("PATH")) {
+		if filepath.Clean(p) == filepath.Clean(dir) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathHint(dir string) string {
+	if runtime.GOOS == "windows" {
+		return "Add it under Settings > System > About > Advanced system settings > Environment Variables > Path (your user), then open a new terminal."
+	}
+	rc := "~/.profile"
+	switch filepath.Base(os.Getenv("SHELL")) {
+	case "zsh":
+		rc = "~/.zprofile"
+	case "bash":
+		rc = "~/.bashrc"
+	case "fish":
+		return "Run: fish_add_path " + dir
+	}
+	return fmt.Sprintf("Run: echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> %s, then open a new terminal.", rc)
 }
 
 func explainTrust(root *ca.CA) {
@@ -198,7 +266,7 @@ func cmdHosts(args []string, action string) error {
 	if err != nil {
 		return err
 	}
-	var hosts []string
+	var hosts []platform.HostEntry
 	if action != "remove" {
 		st, err := store.Open(filepath.Join(*data, "state.json"))
 		if err != nil {
@@ -206,11 +274,14 @@ func cmdHosts(args []string, action string) error {
 		}
 		st.View(func(s *store.State) {
 			for _, v := range s.Services {
-				hosts = append(hosts, v.Hostname)
+				hosts = append(hosts, platform.HostEntry{Name: v.Hostname, Addr: v.Address})
 			}
 		})
 	}
-	next := platform.RenderHosts(string(cur), hosts)
+	next, err := platform.RenderHosts(string(cur), hosts)
+	if err != nil {
+		return err
+	}
 	if next == string(cur) {
 		fmt.Printf("%s is up to date.\n", path)
 		return nil
@@ -345,8 +416,9 @@ func cmdCARestore(args []string) error {
 		if err != nil {
 			return err
 		}
-		perm := os.FileMode(0o600)
-		if strings.HasSuffix(name, ".pem") && !strings.Contains(name, "key") {
+		perm := os.FileMode(0o600) // keys, bundles, state
+		switch filepath.Base(name) {
+		case "root.pem", "certificate.pem", "ca.pem":
 			perm = 0o644
 		}
 		if err := store.WriteFileAtomic(filepath.Join(*data, name), b, perm); err != nil {

@@ -24,13 +24,15 @@ Services:
   devca proxy add <host> <target>    HTTPS proxy, e.g. devca proxy add api.localhost 3000
   devca proxy list
   devca proxy remove <host>
-  devca cert issue <host> [--out dir]  certificate files for an app that does its own TLS
+  devca cert issue <host> [--out dir] [--address 127.0.0.x]
+                                     certificate files for an app that does its own TLS
   devca cert list
   devca cert renew <host>
   devca cert revoke <host|id>
   devca cert export <host> --out dir
   devca acme info                    ACME directory URL and accounts
-  devca acme claim <host> [--port n] reserve a host for an external ACME client
+  devca acme claim <host> [--port n] [--address 127.0.0.x]
+                                     reserve a host for an external ACME client
   devca test acme <host>             run a full ACME issuance against DevCA
 
 CA and system:
@@ -149,13 +151,20 @@ func parse(fs *flag.FlagSet, args []string) []string {
 	}
 }
 
+// stdin is shared so answers piped in for several prompts aren't lost to a
+// per-prompt buffer.
+var stdin = bufio.NewReader(os.Stdin)
+
 func confirm(question string, defaultYes bool) bool {
 	hint := " [y/N] "
 	if defaultYes {
 		hint = " [Y/n] "
 	}
 	fmt.Print(question + hint)
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, _ := stdin.ReadString('\n')
+	if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice == 0 {
+		fmt.Println(strings.TrimSpace(line)) // piped answer: echo it so the transcript reads right
+	}
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":
 		return true

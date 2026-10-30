@@ -119,12 +119,13 @@ func (m *Manager) Ensure(host string, force, rekey bool) error {
 		return fmt.Errorf("%s is managed by an external ACME client", host)
 	}
 	dir := m.CertDir(host)
-	if !force && !needsRenewal(cur, host, renewDays, m.now()) {
+	keyPath := filepath.Join(dir, FileKey)
+	if _, err := os.Stat(keyPath); err == nil && !force && !needsRenewal(cur, host, renewDays, m.now()) {
 		// Cert is current; make sure exports exist (e.g. ExportDir was just set).
-		return m.export(svc, dir, cur, false)
+		return m.export(svc, cur, false)
 	}
 
-	key, err := loadKey(filepath.Join(dir, FileKey))
+	key, err := loadKey(keyPath) // a missing key (deleted, or removed by Revoke) means a fresh one
 	if rekey || err != nil {
 		if key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader); err != nil {
 			return err
@@ -135,12 +136,14 @@ func (m *Manager) Ensure(host string, force, rekey bool) error {
 		m.Store.Log("error", "cert", "Issuing %s failed: %v", host, err)
 		return err
 	}
-	if err := writeKey(filepath.Join(dir, FileKey), key); err != nil {
+	if err := writeKey(keyPath, key); err != nil {
 		return err
 	}
-	if err := m.export(svc, dir, c, true); err != nil {
+	if err := m.writeFiles(dir, c); err != nil {
 		return err
 	}
+	// Record the new cert before the optional ExportDir copy, so a broken
+	// export directory can't make every renewal pass issue yet another cert.
 	err = m.Store.Update(func(s *store.State) error {
 		if v := s.Service(host); v != nil {
 			v.CertID = c.ID
@@ -148,19 +151,16 @@ func (m *Manager) Ensure(host string, force, rekey bool) error {
 		return nil
 	})
 	m.changed()
-	return err
-}
-
-// export writes the cert files to dir and to svc.ExportDir.
-// Order is key, then bundle, then cert, so an app watching certificate.pem
-// always sees a matching key once it changes. Keys are reused across renewals,
-// so normally only the certificate changes anyway.
-func (m *Manager) export(svc store.Service, dir string, c *store.Cert, overwrite bool) error {
-	keyPEM, err := os.ReadFile(filepath.Join(dir, FileKey))
 	if err != nil {
 		return err
 	}
-	dirs := []string{dir}
+	return m.export(svc, c, true)
+}
+
+// export copies the cert files to svc.ExportDir (export mode only), and
+// recreates them in the data dir if missing. overwrite=false only fills gaps.
+func (m *Manager) export(svc store.Service, c *store.Cert, overwrite bool) error {
+	dirs := []string{m.CertDir(svc.Hostname)}
 	if svc.ExportDir != "" && svc.Mode == store.ModeExport {
 		dirs = append(dirs, svc.ExportDir)
 	}
@@ -170,20 +170,36 @@ func (m *Manager) export(svc store.Service, dir string, c *store.Cert, overwrite
 				continue
 			}
 		}
-		files := []struct {
-			name string
-			data []byte
-			perm os.FileMode
-		}{
-			{FileKey, keyPEM, 0o600},
-			{FileCA, m.CA.CertPEM, 0o644},
-			{FileBundle, append(append([]byte{}, keyPEM...), c.PEM...), 0o600},
-			{FileCert, []byte(c.PEM), 0o644},
+		if err := m.writeFiles(d, c); err != nil {
+			m.Store.Log("error", "cert", "Writing certificate files for %s to %s failed: %v", svc.Hostname, d, err)
+			return err
 		}
-		for _, f := range files {
-			if err := store.WriteFileAtomic(filepath.Join(d, f.name), f.data, f.perm); err != nil {
-				return fmt.Errorf("export %s: %w", d, err)
-			}
+	}
+	return nil
+}
+
+// writeFiles writes key, CA, bundle and cert to d, reading the key from the
+// data dir. Order is key, then bundle, then cert, so an app watching
+// certificate.pem always sees a matching key once it changes. Keys are reused
+// across renewals, so normally only the certificate changes anyway.
+func (m *Manager) writeFiles(d string, c *store.Cert) error {
+	keyPEM, err := os.ReadFile(filepath.Join(m.CertDir(c.Names[0]), FileKey))
+	if err != nil {
+		return err
+	}
+	files := []struct {
+		name string
+		data []byte
+		perm os.FileMode
+	}{
+		{FileKey, keyPEM, 0o600},
+		{FileCA, m.CA.CertPEM, 0o644},
+		{FileBundle, append(append([]byte{}, keyPEM...), c.PEM...), 0o600},
+		{FileCert, []byte(c.PEM), 0o644},
+	}
+	for _, f := range files {
+		if err := store.WriteFileAtomic(filepath.Join(d, f.name), f.data, f.perm); err != nil {
+			return fmt.Errorf("write %s: %w", d, err)
 		}
 	}
 	return nil
@@ -225,7 +241,7 @@ func (m *Manager) Run(ctx context.Context) {
 // Revoke marks a certificate revoked. If it belongs to an active managed
 // service, a replacement with a fresh key is issued immediately.
 func (m *Manager) Revoke(id int64) error {
-	var host string
+	var host, keyHost string
 	err := m.Store.Update(func(s *store.State) error {
 		c := s.Cert(id)
 		if c == nil {
@@ -236,13 +252,26 @@ func (m *Manager) Revoke(id int64) error {
 		}
 		c.Revoked, c.RevokedAt = true, m.now()
 		s.Log("warn", "cert", "Revoked certificate for %s (serial %s)", strings.Join(c.Names, ", "), c.Serial)
-		if v := s.Service(c.Names[0]); v != nil && v.CertID == id && v.Enabled && v.Mode != store.ModeACME {
-			host = v.Hostname
+		if v := s.Service(c.Names[0]); v != nil && v.CertID == id && v.Mode != store.ModeACME {
+			keyHost = v.Hostname
+			if v.Enabled {
+				host = v.Hostname
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		return err
+	}
+	if keyHost != "" {
+		// The revoked cert's key must never be signed again, even if
+		// re-issuing below fails or the service is only re-enabled later.
+		m.mu.Lock()
+		err = os.Remove(filepath.Join(m.CertDir(keyHost), FileKey))
+		m.mu.Unlock()
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	m.changed()
 	if host != "" {
@@ -254,13 +283,20 @@ func (m *Manager) Revoke(id int64) error {
 // RemoveFiles deletes the service's files inside the data dir. Files in a
 // user-chosen ExportDir are left alone.
 func (m *Manager) RemoveFiles(host string) error {
+	m.mu.Lock() // not while an Ensure for this host is still writing files
+	defer m.mu.Unlock()
 	return os.RemoveAll(m.CertDir(host))
 }
 
 // TLSCertificate loads the service's key pair for the gateway.
 func (m *Manager) TLSCertificate(host string) (*tls.Certificate, error) {
-	dir := m.CertDir(host)
-	c, err := tls.LoadX509KeyPair(filepath.Join(dir, FileCert), filepath.Join(dir, FileKey))
+	// bundle.pem holds key and cert in one atomically written file, so a
+	// reload during a rekey can't pair a new key with an old cert.
+	bundle, err := os.ReadFile(filepath.Join(m.CertDir(host), FileBundle))
+	if err != nil {
+		return nil, err
+	}
+	c, err := tls.X509KeyPair(bundle, bundle)
 	if err != nil {
 		return nil, err
 	}

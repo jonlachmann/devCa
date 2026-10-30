@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/user"
 	"strconv"
+	"strings"
 )
 
 const unitPath = "/etc/systemd/system/devca.service"
@@ -30,7 +31,7 @@ Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
-`, u.Username, strconv.Quote(exe), strconv.Quote(dataDir))
+`, u.Username, systemdQuote(exe), systemdQuote(dataDir))
 	tmp, err := os.CreateTemp("", "devca-unit")
 	if err != nil {
 		return err
@@ -44,7 +45,15 @@ WantedBy=multi-user.target
 	if err := RunPrivileged("systemctl", "daemon-reload"); err != nil {
 		return err
 	}
-	return RunPrivileged("systemctl", "enable", "--now", "devca")
+	if err := RunPrivileged("systemctl", "enable", "devca"); err != nil {
+		return err
+	}
+	return RunPrivileged("systemctl", "restart", "devca") // also picks up a replaced binary
+}
+
+// systemdQuote quotes a path for ExecStart; % starts a systemd specifier.
+func systemdQuote(s string) string {
+	return strings.ReplaceAll(strconv.Quote(s), "%", "%%")
 }
 
 func ServiceUninstall() error {

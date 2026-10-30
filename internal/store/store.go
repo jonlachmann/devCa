@@ -1,7 +1,7 @@
 // Package store persists all DevCA state in a single JSON file.
 //
-// ponytail: whole-file rewrite on every change; fine for dozens of services
-// and certs. Move to SQLite if state ever grows past a few MB.
+// Every change rewrites the whole file. That's fine for dozens of services
+// and certs; move to SQLite if state ever grows past a few MB.
 package store
 
 import (
@@ -47,6 +47,7 @@ type Service struct {
 	Target         string    `json:"target,omitempty"`         // proxy mode
 	ExportDir      string    `json:"exportDir,omitempty"`      // extra export location (export mode)
 	ValidationPort int       `json:"validationPort,omitempty"` // acme mode: where HTTP-01 is checked
+	Address        string    `json:"address,omitempty"`        // loopback IP for the hosts file; "" = 127.0.0.1 and ::1
 	Enabled        bool      `json:"enabled"`
 	AutoRenew      bool      `json:"autoRenew"`
 	CertID         int64     `json:"certId,omitempty"`
@@ -222,8 +223,8 @@ func (s *State) Prune(now time.Time) {
 	s.Authzs = authzs
 }
 
-// Store guards State with a single mutex.
-// ponytail: global lock; per-object locking only if this ever gets contended.
+// Store guards State with a single global mutex. Per-object locking is only
+// worth it if this ever gets contended.
 type Store struct {
 	mu   sync.Mutex
 	path string

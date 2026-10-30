@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -36,6 +38,9 @@ type API struct {
 	UI       fs.FS
 	// Ports actually bound by this process (settings may have changed since).
 	MgmtPort, ACMEPort, HTTPPort, HTTPSPort int
+	// Running is the settings this process started with; listener and log
+	// changes only apply after a restart.
+	Running store.Settings
 	// ACMELeaf is the ACME listener's certificate, used to check OS trust.
 	ACMELeaf func() *x509.Certificate
 }
@@ -227,11 +232,11 @@ func (a *API) serviceViews() []serviceView {
 	var out []serviceView
 	a.Store.View(func(s *store.State) {
 		for _, svc := range s.Services {
-			v := serviceView{Service: *svc, InHosts: slices.Contains(inHosts, svc.Hostname)}
+			v := serviceView{Service: *svc, InHosts: inHosts[svc.Hostname] == platform.HostsAddr(svc.Address)}
 			switch {
 			case v.InHosts:
 				v.Resolves = "hosts"
-			case strings.HasSuffix(svc.Hostname, ".localhost"):
+			case strings.HasSuffix(svc.Hostname, ".localhost") && svc.Address == "":
 				v.Resolves = "browser"
 			default:
 				v.Resolves = "missing"
@@ -264,13 +269,14 @@ func (a *API) serviceViews() []serviceView {
 func (a *API) listServices(*http.Request) (any, error) { return a.serviceViews(), nil }
 
 type serviceInput struct {
-	Hostname       string `json:"hostname"`
-	Mode           string `json:"mode"`
-	Target         string `json:"target"`
-	ExportDir      string `json:"exportDir"`
-	ValidationPort int    `json:"validationPort"`
-	Enabled        *bool  `json:"enabled"`
-	AutoRenew      *bool  `json:"autoRenew"`
+	Hostname       string  `json:"hostname"`
+	Mode           string  `json:"mode"`
+	Target         string  `json:"target"`
+	ExportDir      string  `json:"exportDir"`
+	ValidationPort int     `json:"validationPort"`
+	Address        *string `json:"address"` // nil keeps the current value
+	Enabled        *bool   `json:"enabled"`
+	AutoRenew      *bool   `json:"autoRenew"`
 }
 
 // apply validates in and writes it onto svc.
@@ -301,6 +307,19 @@ func (a *API) apply(svc *store.Service, in serviceInput) error {
 			return bad("validation port must be between 1 and 65535")
 		}
 		svc.ValidationPort = in.ValidationPort
+	}
+	if in.Address != nil {
+		svc.Address = ""
+		if s := strings.TrimSpace(*in.Address); s != "" && s != "127.0.0.1" {
+			ip, err := netip.ParseAddr(s)
+			if err != nil || !ip.IsLoopback() || ip.Zone() != "" || ip.Is4In6() || ip.String() != s {
+				return bad("address must be a loopback address such as 127.0.0.2")
+			}
+			svc.Address = ip.String()
+		}
+	}
+	if svc.Mode == store.ModeProxy && svc.Address != "" {
+		return bad("proxy services are reached through the gateway on 127.0.0.1; clear the loopback address first")
 	}
 	if in.Enabled != nil {
 		svc.Enabled = *in.Enabled
@@ -367,7 +386,7 @@ func (a *API) findService(host string) (any, error) {
 }
 
 func (a *API) updateService(r *http.Request) (any, error) {
-	host := r.PathValue("host")
+	host := strings.ToLower(r.PathValue("host"))
 	var in serviceInput
 	if err := decode(r, &in); err != nil {
 		return nil, err
@@ -395,7 +414,7 @@ func (a *API) updateService(r *http.Request) (any, error) {
 }
 
 func (a *API) deleteService(r *http.Request) (any, error) {
-	host := r.PathValue("host")
+	host := strings.ToLower(r.PathValue("host"))
 	err := a.Store.Update(func(s *store.State) error {
 		i := slices.IndexFunc(s.Services, func(v *store.Service) bool { return v.Hostname == host })
 		if i < 0 {
@@ -414,7 +433,7 @@ func (a *API) deleteService(r *http.Request) (any, error) {
 }
 
 func (a *API) renewService(r *http.Request) (any, error) {
-	host := r.PathValue("host")
+	host := strings.ToLower(r.PathValue("host"))
 	if err := a.Certs.Ensure(host, true, false); err != nil {
 		return nil, bad("%v", err)
 	}
@@ -656,10 +675,16 @@ func (a *API) testACME(r *http.Request) (any, error) {
 
 // ---- settings, status, events, hosts ----
 
+func (a *API) needsRestart(s store.Settings) bool {
+	r := a.Running
+	return r.HTTPPort != s.HTTPPort || r.HTTPSPort != s.HTTPSPort || r.MgmtPort != s.MgmtPort ||
+		r.ACMEPort != s.ACMEPort || r.GatewayEnabled != s.GatewayEnabled || r.LogLevel != s.LogLevel
+}
+
 func (a *API) getSettings(*http.Request) (any, error) {
 	var s store.Settings
 	a.Store.View(func(st *store.State) { s = st.Settings })
-	return map[string]any{"settings": s, "suffixes": a.Certs.CA.Suffixes(), "dataDir": a.DataDir}, nil
+	return map[string]any{"settings": s, "suffixes": a.Certs.CA.Suffixes(), "dataDir": a.DataDir, "restartRequired": a.needsRestart(s)}, nil
 }
 
 func (a *API) putSettings(r *http.Request) (any, error) {
@@ -688,11 +713,7 @@ func (a *API) putSettings(r *http.Request) (any, error) {
 	if !slices.Contains(a.Certs.CA.Suffixes(), in.DefaultSuffix) {
 		return nil, bad("default suffix must be one of %v", a.Certs.CA.Suffixes())
 	}
-	var restart bool
 	err := a.Store.Update(func(s *store.State) error {
-		o := s.Settings
-		restart = o.HTTPPort != in.HTTPPort || o.HTTPSPort != in.HTTPSPort || o.MgmtPort != in.MgmtPort ||
-			o.ACMEPort != in.ACMEPort || o.GatewayEnabled != in.GatewayEnabled || o.LogLevel != in.LogLevel
 		s.Settings = in
 		s.Log("info", "settings", "Settings updated")
 		return nil
@@ -700,7 +721,7 @@ func (a *API) putSettings(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"settings": in, "restartRequired": restart}, nil
+	return map[string]any{"settings": in, "restartRequired": a.needsRestart(in)}, nil
 }
 
 func (a *API) events(*http.Request) (any, error) {
@@ -715,12 +736,12 @@ func (a *API) hostsInfo(*http.Request) (any, error) {
 	var missing []string
 	a.Store.View(func(s *store.State) {
 		for _, svc := range s.Services {
-			if !slices.Contains(in, svc.Hostname) {
+			if in[svc.Hostname] != platform.HostsAddr(svc.Address) {
 				missing = append(missing, svc.Hostname)
 			}
 		}
 	})
-	return map[string]any{"path": platform.HostsPath(), "managed": in, "missing": missing, "command": "devca hosts apply"}, nil
+	return map[string]any{"path": platform.HostsPath(), "managed": slices.Sorted(maps.Keys(in)), "missing": missing, "command": "devca hosts apply"}, nil
 }
 
 func (a *API) status(*http.Request) (any, error) {

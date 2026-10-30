@@ -48,6 +48,7 @@ type Gateway struct {
 	Certs     *certs.Manager
 	HTTPSPort int
 
+	reloadMu  sync.Mutex // serializes Reload so an older snapshot can't win
 	mu        sync.RWMutex
 	routes    map[string]*route
 	listeners []Listener
@@ -130,6 +131,8 @@ func (g *Gateway) init() {
 
 // Reload rebuilds the routing table from the store. Cheap; call after any change.
 func (g *Gateway) Reload() {
+	g.reloadMu.Lock()
+	defer g.reloadMu.Unlock()
 	g.mu.Lock()
 	g.init()
 	g.mu.Unlock()

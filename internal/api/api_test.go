@@ -81,3 +81,38 @@ func TestCreateServiceValidation(t *testing.T) {
 		t.Fatalf("duplicate: %d", w.Code)
 	}
 }
+
+func TestServiceAddress(t *testing.T) {
+	h := newAPI(t)
+	do := func(method, path, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "http://127.0.0.1:7171"+path, strings.NewReader(body))
+		r.Header.Set("X-DevCA", "1")
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	for _, body := range []string{
+		`{"hostname":"a.localhost","mode":"export","address":"10.0.0.2"}`,
+		`{"hostname":"a.localhost","mode":"export","address":"nope"}`,
+		`{"hostname":"a.localhost","mode":"proxy","target":"3000","address":"127.0.0.2"}`,
+	} {
+		if w := do("POST", "/api/services", body); w.Code != 400 {
+			t.Errorf("%s: got %d %s", body, w.Code, w.Body)
+		}
+	}
+	if w := do("POST", "/api/services", `{"hostname":"a.localhost","mode":"export","address":"127.0.0.2"}`); w.Code != 200 || !strings.Contains(w.Body.String(), `"address":"127.0.0.2"`) {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	// An update without "address" keeps it; switching to proxy is refused while it's set.
+	if w := do("PUT", "/api/services/a.localhost", `{"mode":"export"}`); !strings.Contains(w.Body.String(), `"address":"127.0.0.2"`) {
+		t.Fatalf("address lost on update: %s", w.Body)
+	}
+	if w := do("PUT", "/api/services/a.localhost", `{"mode":"proxy","target":"3000"}`); w.Code != 400 {
+		t.Fatalf("proxy with address: %d", w.Code)
+	}
+	// 127.0.0.1 means the default.
+	if w := do("PUT", "/api/services/a.localhost", `{"mode":"export","address":"127.0.0.1"}`); strings.Contains(w.Body.String(), `"address"`) {
+		t.Fatalf("127.0.0.1 not normalized: %s", w.Body)
+	}
+}

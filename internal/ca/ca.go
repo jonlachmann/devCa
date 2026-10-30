@@ -170,6 +170,9 @@ func (c *CA) Pool() *x509.CertPool {
 // Names must already be lowercase.
 func (c *CA) CheckName(name string, allowWildcard bool) error {
 	if ip, err := netip.ParseAddr(name); err == nil {
+		if ip.Zone() != "" || ip.Is4In6() || ip.String() != name {
+			return fmt.Errorf("%s: write IP addresses in plain form, e.g. 127.0.0.1 or ::1", name)
+		}
 		if !ip.IsLoopback() {
 			return fmt.Errorf("%s: only loopback IP addresses are allowed", name)
 		}
@@ -229,17 +232,8 @@ func (c *CA) Issue(names []string, pub crypto.PublicKey, validity time.Duration)
 	if len(names) == 0 {
 		return nil, errors.New("no names")
 	}
-	switch k := pub.(type) {
-	case *ecdsa.PublicKey:
-		if k.Curve != elliptic.P256() && k.Curve != elliptic.P384() {
-			return nil, errors.New("unsupported ECDSA curve (use P-256 or P-384)")
-		}
-	case *rsa.PublicKey:
-		if k.N.BitLen() < 2048 {
-			return nil, errors.New("RSA keys must be at least 2048 bits")
-		}
-	default:
-		return nil, errors.New("unsupported key type (use ECDSA or RSA)")
+	if err := CheckKey(pub); err != nil {
+		return nil, err
 	}
 	now := time.Now()
 	tmpl := &x509.Certificate{
@@ -271,6 +265,23 @@ func (c *CA) Issue(names []string, pub crypto.PublicKey, validity time.Duration)
 		return nil, err
 	}
 	return x509.ParseCertificate(der)
+}
+
+// CheckKey accepts the key types browsers support for TLS certificates.
+func CheckKey(pub crypto.PublicKey) error {
+	switch k := pub.(type) {
+	case *ecdsa.PublicKey:
+		if k.Curve != elliptic.P256() && k.Curve != elliptic.P384() {
+			return errors.New("unsupported ECDSA curve (use P-256 or P-384)")
+		}
+	case *rsa.PublicKey:
+		if k.N.BitLen() < 2048 {
+			return errors.New("RSA keys must be at least 2048 bits")
+		}
+	default:
+		return errors.New("unsupported key type (use ECDSA or RSA)")
+	}
+	return nil
 }
 
 func randSerial() *big.Int {

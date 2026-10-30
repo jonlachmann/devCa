@@ -12,7 +12,7 @@
   let suffix = $derived(settings.data?.settings.defaultSuffix ?? 'localhost')
 
   let adding = $state(location.hash.includes('?new'))
-  let form = $state({ hostname: '', mode: 'proxy' as Mode, target: '', exportDir: '', validationPort: '' })
+  let form = $state({ hostname: '', mode: 'proxy' as Mode, target: '', exportDir: '', validationPort: '', address: '' })
   let busy = $state(false)
   let expanded = $state<string | null>(null)
 
@@ -39,31 +39,51 @@
           target: form.target,
           exportDir: form.exportDir,
           validationPort: Number(form.validationPort) || 0,
+          address: form.mode === 'proxy' ? '' : form.address,
         }),
       `Added ${fullHost(form.hostname)}`,
     )
     busy = false
     if (ok) {
       expanded = fullHost(form.hostname)
-      form = { hostname: '', mode: form.mode, target: '', exportDir: '', validationPort: '' }
+      form = { hostname: '', mode: form.mode, target: '', exportDir: '', validationPort: '', address: '' }
       adding = false
       services.reload()
     }
   }
 
+  // Bumped after a rejected update so inputs re-render from server state
+  // instead of keeping the value the server refused.
+  let rev = $state(0)
+
   async function update(v: Service, patch: Partial<Service>) {
     const next = { ...v, ...patch }
-    await attempt(() =>
+    const ok = await attempt(() =>
       api('PUT', `/api/services/${v.hostname}`, {
         mode: next.mode,
         target: next.target ?? '',
         exportDir: next.exportDir ?? '',
         validationPort: next.validationPort ?? 0,
+        address: next.address ?? '',
         enabled: next.enabled,
         autoRenew: next.autoRenew,
       }),
     )
-    services.reload()
+    await services.reload()
+    if (!ok) rev++
+  }
+
+  // Proxy mode needs a target, which Files/ACME services don't have yet.
+  function changeMode(v: Service, mode: Mode) {
+    let target = v.target ?? ''
+    if (mode === 'proxy' && !target) {
+      target = prompt(`Proxy ${v.hostname} to which port or address on this computer?`, '3000')?.trim() ?? ''
+      if (!target) {
+        rev++
+        return
+      }
+    }
+    update(v, { mode, target, address: mode === 'proxy' ? '' : v.address })
   }
 
   async function renew(v: Service) {
@@ -131,6 +151,13 @@
         <div class="hint">DevCA's gateway uses port 80, so run your client's challenge server on another port (e.g. <code>lego --http.port :5002</code>) and enter it here.</div>
       </div>
     {/if}
+    {#if form.mode !== 'proxy'}
+      <div class="field">
+        <label for="addr">Loopback address <span class="muted">(optional)</span></label>
+        <input id="addr" type="text" bind:value={form.address} placeholder="127.0.0.1" autocomplete="off" spellcheck="false" />
+        <div class="hint">Give this hostname its own address, e.g. <code>127.0.0.2</code>, so its app can use the same port as another service. Used for the hosts file; bind your app to it.</div>
+      </div>
+    {/if}
     <div class="actions">
       <button class="btn primary" disabled={busy}>{busy ? 'Adding…' : 'Add service'}</button>
       <button type="button" class="btn ghost" onclick={() => (adding = false)}>Cancel</button>
@@ -152,6 +179,7 @@
         <strong>{v.hostname}</strong>
       </button>
       <Badge tone="accent">{modeLabel[v.mode]}</Badge>
+      {#if v.address}<span class="muted small mono">{v.address}</span>{/if}
       {#if !v.enabled}<Badge>disabled</Badge>{/if}
       <span class="spacer"></span>
       {#if v.mode === 'proxy'}
@@ -174,13 +202,16 @@
     </div>
 
     {#if v.resolves === 'missing'}
-      <p class="small warn-text">{v.hostname} isn't in your hosts file yet, so it won't resolve. Run <code>devca hosts apply</code>.</p>
+      <p class="small warn-text">
+        {v.hostname} isn't in your hosts file{v.address ? ` with ${v.address}` : ''} yet, so it won't resolve{v.address ? ' there' : ''}. Run <code>devca hosts apply</code>.
+      </p>
     {/if}
     {#if v.health && !v.health.up && v.enabled}
       <p class="small muted">{v.health.error}. Start your app, or change the target.</p>
     {/if}
 
     {#if expanded === v.hostname}
+      {#key rev}
       <div class="details">
         {#if v.mode === 'proxy'}
           <div class="field inline">
@@ -194,6 +225,12 @@
           <Code text={v.certDir} />
           {#if v.exportDir}<Code text={v.exportDir} />{/if}
         {/if}
+        {#if v.mode !== 'proxy'}
+          <div class="field inline">
+            <label for={'a-' + v.hostname}>Loopback address</label>
+            <input id={'a-' + v.hostname} type="text" value={v.address ?? ''} placeholder="127.0.0.1" onchange={(e) => update(v, { address: e.currentTarget.value })} />
+          </div>
+        {/if}
         {#if v.mode === 'acme'}
           <p class="small muted">An external ACME client owns this hostname. DevCA issues when the client asks and never renews on its own. See <a href="#/acme">ACME</a> for the directory URL.</p>
         {/if}
@@ -206,7 +243,7 @@
             <label class="check"><input type="checkbox" checked={v.autoRenew} onchange={(e) => update(v, { autoRenew: e.currentTarget.checked })} /> Renew automatically</label>
           {/if}
           <span class="spacer"></span>
-          <select aria-label="Mode" value={v.mode} onchange={(e) => update(v, { mode: e.currentTarget.value as Mode, target: v.target || '' })}>
+          <select aria-label="Mode" value={v.mode} onchange={(e) => changeMode(v, e.currentTarget.value as Mode)}>
             {#each modes as m}<option value={m.id}>{m.title}</option>{/each}
           </select>
           {#if v.mode !== 'acme'}
@@ -216,6 +253,7 @@
           <button class="btn small danger" onclick={() => remove(v)}><Icon name="trash" size={16} /> Remove</button>
         </div>
       </div>
+      {/key}
     {/if}
   </div>
 {/each}

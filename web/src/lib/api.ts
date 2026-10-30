@@ -23,7 +23,7 @@ export async function download(path: string) {
   a.href = url
   a.download = name
   a.click()
-  URL.revokeObjectURL(url)
+  setTimeout(() => URL.revokeObjectURL(url), 10_000) // some browsers read it after click() returns
 }
 
 export type Problem = { type: string; detail: string }
@@ -56,6 +56,7 @@ export type Service = {
   target?: string
   exportDir?: string
   validationPort?: number
+  address?: string
   enabled: boolean
   autoRenew: boolean
   url?: string

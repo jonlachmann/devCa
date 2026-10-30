@@ -41,11 +41,7 @@ func DefaultResolve(ctx context.Context, host string) ([]netip.Addr, error) {
 	return addrs, err
 }
 
-func (v *Validator) resolveLoopback(ctx context.Context, host string) (netip.Addr, *store.Problem) {
-	resolve := v.Resolve
-	if resolve == nil {
-		resolve = DefaultResolve
-	}
+func resolveLoopback(ctx context.Context, resolve func(context.Context, string) ([]netip.Addr, error), host string) (netip.Addr, *store.Problem) {
 	addrs, err := resolve(ctx, host)
 	if err != nil || len(addrs) == 0 {
 		return netip.Addr{}, &store.Problem{Type: errDNS, Detail: fmt.Sprintf(
@@ -61,11 +57,25 @@ func (v *Validator) resolveLoopback(ctx context.Context, host string) (netip.Add
 }
 
 // HTTP01 fetches http://host:port/.well-known/acme-challenge/token and
-// compares it to keyAuth. It returns nil on success.
-func (v *Validator) HTTP01(ctx context.Context, host string, port int, token, keyAuth string) *store.Problem {
+// compares it to keyAuth. It returns nil on success. A non-empty pin is the
+// service's configured loopback address and is used instead of resolving host.
+func (v *Validator) HTTP01(ctx context.Context, host, pin string, port int, token, keyAuth string) *store.Problem {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if _, p := v.resolveLoopback(ctx, host); p != nil {
+	resolve := v.Resolve
+	if resolve == nil {
+		resolve = DefaultResolve
+	}
+	if ip, err := netip.ParseAddr(pin); err == nil {
+		base := resolve
+		resolve = func(ctx context.Context, h string) ([]netip.Addr, error) {
+			if h == host {
+				return []netip.Addr{ip}, nil
+			}
+			return base(ctx, h)
+		}
+	}
+	if _, p := resolveLoopback(ctx, resolve, host); p != nil {
 		return p
 	}
 	var dialErr atomic.Pointer[store.Problem]
@@ -76,7 +86,7 @@ func (v *Validator) HTTP01(ctx context.Context, host string, port int, token, ke
 			if err != nil {
 				return nil, err
 			}
-			ip, prob := v.resolveLoopback(ctx, h) // redirects are re-checked here too
+			ip, prob := resolveLoopback(ctx, resolve, h) // redirects are re-checked here too
 			if prob != nil {
 				dialErr.Store(prob)
 				return nil, errors.New(prob.Detail)

@@ -12,8 +12,25 @@ The goal is to make local HTTPS boring.
 
 ## Quick start
 
+Download the binary for your platform (`devca-<os>-<arch>`) and run `install` from wherever it landed:
+
 ```sh
-devca install                         # create the CA, trust it (asks first), run in the background
+# macOS: downloaded binaries are quarantined (unsigned); clear that first
+xattr -d com.apple.quarantine ~/Downloads/devca-darwin-arm64
+# Linux: chmod +x devca-linux-amd64
+
+~/Downloads/devca-darwin-arm64 install   # Windows: devca-windows-amd64.exe install
+```
+
+`install` does the following, asking before each system change:
+1. Creates the CA.
+2. Offers to trust it.
+3. Copies the program to `~/.local/bin/devca` (Windows: `%LOCALAPPDATA%\Programs\devca\devca.exe`) and tells you if that directory isn't on your PATH yet.
+4. Offers to run DevCA in the background from there.
+
+Afterwards the download can be deleted. To upgrade, run `install` from a newer download; it replaces the copy and restarts the service.
+
+```sh
 devca proxy add api.localhost 3000    # https://api.localhost -> http://localhost:3000
 open https://api.localhost
 ```
@@ -111,6 +128,23 @@ How DevCA edits the hosts file:
 - It always shows the diff first and asks before writing.
 - It writes both `127.0.0.1` and `::1` for each name. Without the IPv6 line, macOS stalls for about 5 seconds on `.local` names while it waits for mDNS.
 
+### Two services on the same port
+
+Two apps can't both listen on `127.0.0.1:8443`. If you can change their ports, that's the simplest fix. If both need the same port, for example two instances of one app, or software where the port isn't configurable, give each hostname its own loopback address. Every address in `127.0.0.0/8` points to your own machine:
+
+```sh
+devca cert issue one.localhost --address 127.0.0.2 --out ./one/certs
+devca cert issue two.localhost --address 127.0.0.3 --out ./two/certs
+devca hosts apply      # writes "127.0.0.2 one.localhost" and "127.0.0.3 two.localhost"
+```
+
+Then bind each app to its own address (`127.0.0.2:8443` and `127.0.0.3:8443`). The same `--address` flag works with `devca acme claim`, and ACME validation then checks that address too. In the UI it's the optional "Loopback address" field.
+
+- **macOS** only configures `127.0.0.1`. Add the others first with `sudo ifconfig lo0 alias 127.0.0.2 up`. Aliases are lost on reboot, so re-run that or add it to a startup script. **Linux** and **Windows** answer on the whole `127.0.0.0/8` range out of the box.
+- **Browsers ignore the hosts file for `*.localhost`** and always connect to `127.0.0.1`. This setup is therefore for clients that use the system resolver (CLI tools, SDKs, other services). If a browser must reach a service on its own address, use a `.local` name instead.
+- **Only for Files and ACME client services.** Proxy services are reached through the gateway on `127.0.0.1`.
+- **Only the custom address is written.** DevCA writes just that IPv4 line, with no `::1` line, so clients can't end up at a different service over IPv6.
+
 **Why DevCA doesn't answer `.local` names over mDNS itself:**
 - mDNS announces names to everyone on your network. Answering `api.local → 127.0.0.1` tells every other machine on the Wi-Fi that `api.local` is *their own* loopback address, which RFC 6762 forbids.
 - Two developers on the same network who both use `api.local` would trigger mDNS conflict resolution, and one of them would get renamed to `api-2.local`.
@@ -177,7 +211,7 @@ How the commands work:
 **`devca install`:**
 - creates the CA,
 - offers to trust it,
-- offers to run DevCA in the background: a launchd agent on macOS, a systemd unit running as your user with only `CAP_NET_BIND_SERVICE` on Linux, or a logon task on Windows.
+- offers to run DevCA in the background: a launchd agent on macOS, a systemd unit running as your user with only `CAP_NET_BIND_SERVICE` on Linux, or a per-user startup entry (`HKCU\…\Run`, no admin rights) on Windows.
 
 **`devca uninstall`** removes only the background service. It never deletes your CA or certificates, and never removes trust or hosts entries silently.
 
@@ -199,7 +233,20 @@ devca/
 scripts/build.sh          # npm ci + svelte-check + vite build, go vet/test, cross-compile
 ```
 
-This produces static binaries (`CGO_ENABLED=0`, `-trimpath`) for macOS, Linux and Windows on amd64 and arm64, plus `SHA256SUMS`.
+This produces static binaries (`CGO_ENABLED=0`, `-trimpath`) in `dist/devca-<os>-<arch>` for macOS, Linux and Windows on amd64 and arm64, plus `SHA256SUMS`. The version (from `git describe`, or `VERSION=`) is embedded and shown by `devca version`.
+
+**Releases:** pushing a `v*` tag runs `.github/workflows/release.yml`. It builds and tests with `scripts/build.sh` on GitHub Actions, then publishes a GitHub release with every binary and `SHA256SUMS`. Tags with a hyphen (`v1.0.0-rc.1`) become pre-releases.
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+To develop against the installed service, symlink the build instead of copying it. `install` leaves a symlink to the running binary alone, and after each rebuild you only restart the service:
+
+```sh
+ln -sfn "$PWD/dist/devca-darwin-arm64" ~/.local/bin/devca && devca install
+launchctl kickstart -k gui/$(id -u)/dev.devca   # after a rebuild (Linux: sudo systemctl restart devca)
+```
 
 Dependencies are kept deliberately small:
 - **Go:** the standard library plus `golang.org/x/crypto/acme`, which is used only as an *independent* client for the self-test.

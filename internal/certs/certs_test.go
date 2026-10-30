@@ -82,6 +82,55 @@ func TestEnsureRenewalAndKeyReuse(t *testing.T) {
 	}
 }
 
+func TestRevokedKeyNeverReused(t *testing.T) {
+	m := newManager(t)
+	addService(t, m, store.Service{Hostname: "a.localhost", Mode: store.ModeExport, Enabled: true, AutoRenew: true})
+	if err := m.Ensure("a.localhost", false, false); err != nil {
+		t.Fatal(err)
+	}
+	key1, _ := os.ReadFile(filepath.Join(m.CertDir("a.localhost"), FileKey))
+	// Disable, revoke, re-enable: the renewal must use a fresh key.
+	_ = m.Store.Update(func(s *store.State) error { s.Service("a.localhost").Enabled = false; return nil })
+	if err := m.Revoke(serviceCert(m, "a.localhost").ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = m.Store.Update(func(s *store.State) error { s.Service("a.localhost").Enabled = true; return nil })
+	m.RenewAll()
+	key2, _ := os.ReadFile(filepath.Join(m.CertDir("a.localhost"), FileKey))
+	if len(key2) == 0 || string(key1) == string(key2) {
+		t.Fatal("revoked key was reused")
+	}
+}
+
+func TestMissingKeyRecovers(t *testing.T) {
+	m := newManager(t)
+	addService(t, m, store.Service{Hostname: "a.localhost", Mode: store.ModeProxy, Enabled: true, AutoRenew: true})
+	m.Ensure("a.localhost", false, false)
+	os.Remove(filepath.Join(m.CertDir("a.localhost"), FileKey))
+	if err := m.Ensure("a.localhost", false, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.TLSCertificate("a.localhost"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBrokenExportDirDoesNotReissueForever(t *testing.T) {
+	m := newManager(t)
+	blocker := filepath.Join(t.TempDir(), "file")
+	os.WriteFile(blocker, nil, 0o600) // a file where a directory is expected
+	addService(t, m, store.Service{Hostname: "a.localhost", Mode: store.ModeExport, Enabled: true, AutoRenew: true, ExportDir: filepath.Join(blocker, "sub")})
+	if err := m.Ensure("a.localhost", false, false); err == nil {
+		t.Fatal("expected export error")
+	}
+	first := serviceCert(m, "a.localhost").ID
+	m.RenewAll()
+	m.RenewAll()
+	if serviceCert(m, "a.localhost").ID != first {
+		t.Fatal("re-issued because the export directory is broken")
+	}
+}
+
 func TestEnsureRejectsACMEOwned(t *testing.T) {
 	m := newManager(t)
 	addService(t, m, store.Service{Hostname: "x.local", Mode: store.ModeACME, Enabled: true})

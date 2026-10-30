@@ -24,11 +24,25 @@ func HostsPath() string {
 	return "/etc/hosts"
 }
 
-// RenderHosts returns current with DevCA's block replaced by entries for
-// hosts (both IPv4 and IPv6 loopback; macOS stalls on .local names without
-// the ::1 line). Everything outside the block is preserved byte for byte.
-// An empty hosts list removes the block.
-func RenderHosts(current string, hosts []string) string {
+// HostEntry maps a hostname to a loopback address. An empty Addr means the
+// default: 127.0.0.1 and ::1.
+type HostEntry struct{ Name, Addr string }
+
+// HostsAddr is the address a hostname should resolve to.
+func HostsAddr(addr string) string {
+	if addr == "" {
+		return "127.0.0.1"
+	}
+	return addr
+}
+
+// RenderHosts returns current with DevCA's block replaced by entries.
+// Default entries get both IPv4 and IPv6 loopback lines (macOS stalls on
+// .local names without the ::1 line); a custom address gets only its own
+// line, so clients can't reach a different service over ::1.
+// Everything outside the block is preserved byte for byte.
+// An empty entry list removes the block.
+func RenderHosts(current string, entries []HostEntry) (string, error) {
 	nl := "\n"
 	if strings.Contains(current, "\r\n") {
 		nl = "\r\n"
@@ -36,48 +50,59 @@ func RenderHosts(current string, hosts []string) string {
 	before, after := current, ""
 	if i := strings.Index(current, hostsBegin); i >= 0 {
 		before = current[:i]
-		if j := strings.Index(current[i:], hostsEnd); j >= 0 {
-			after = current[i+j+len(hostsEnd):]
-			after = strings.TrimPrefix(strings.TrimPrefix(after, "\r"), "\n")
+		j := strings.Index(current[i:], hostsEnd)
+		if j < 0 {
+			// Guessing where the block ends could delete the user's own lines.
+			return "", fmt.Errorf("%q is in %s but %q is missing; fix or remove DevCA's block by hand, then try again", hostsBegin, HostsPath(), hostsEnd)
 		}
+		after = current[i+j+len(hostsEnd):]
+		after = strings.TrimPrefix(strings.TrimPrefix(after, "\r"), "\n")
 	}
-	if len(hosts) == 0 {
-		return before + after
+	if len(entries) == 0 {
+		return before + after, nil
 	}
 	if before != "" && !strings.HasSuffix(before, "\n") {
 		before += nl
 	}
-	hosts = slices.Clone(hosts)
-	slices.Sort(hosts)
+	entries = slices.Clone(entries)
+	slices.SortFunc(entries, func(a, b HostEntry) int { return strings.Compare(a.Name, b.Name) })
+	entries = slices.CompactFunc(entries, func(a, b HostEntry) bool { return a.Name == b.Name })
 	var b strings.Builder
 	b.WriteString(hostsBegin + nl)
-	for _, h := range slices.Compact(hosts) {
-		fmt.Fprintf(&b, "127.0.0.1 %s%s::1 %s%s", h, nl, h, nl)
+	for _, e := range entries {
+		if e.Addr == "" {
+			fmt.Fprintf(&b, "127.0.0.1 %s%s::1 %s%s", e.Name, nl, e.Name, nl)
+		} else {
+			fmt.Fprintf(&b, "%s %s%s", e.Addr, e.Name, nl)
+		}
 	}
 	b.WriteString(hostsEnd + nl)
-	return before + b.String() + after
+	return before + b.String() + after, nil
 }
 
-// HostsInFile returns the hostnames currently in DevCA's block.
-func HostsInFile() []string {
+// HostsInFile maps each hostname in DevCA's block to its first address.
+func HostsInFile() map[string]string {
+	out := map[string]string{}
 	b, err := os.ReadFile(HostsPath())
 	if err != nil {
-		return nil
+		return out
 	}
 	s := string(b)
 	i := strings.Index(s, hostsBegin)
 	if i < 0 {
-		return nil
+		return out
 	}
 	s = s[i+len(hostsBegin):]
-	if j := strings.Index(s, hostsEnd); j >= 0 {
-		s = s[:j]
+	j := strings.Index(s, hostsEnd)
+	if j < 0 {
+		return out // damaged block: don't mistake the user's lines for ours
 	}
-	var out []string
+	s = s[:j]
 	for _, line := range strings.Split(s, "\n") {
-		f := strings.Fields(line)
-		if len(f) == 2 && f[0] == "127.0.0.1" {
-			out = append(out, f[1])
+		if f := strings.Fields(line); len(f) == 2 {
+			if _, seen := out[f[1]]; !seen {
+				out[f[1]] = f[0]
+			}
 		}
 	}
 	return out
@@ -101,8 +126,8 @@ func HostsDiff(old, new string) string {
 }
 
 // WriteHosts replaces the hosts file content, escalating with sudo on Unix.
-// ponytail: in-place copy rather than rename, so the file keeps its owner,
-// mode and (on macOS) any ACLs; the file is tiny so a torn write is unlikely.
+// It copies in place rather than renaming, so the file keeps its owner, mode
+// and (on macOS) any ACLs; the file is tiny, so a torn write is unlikely.
 func WriteHosts(content string) error {
 	path := HostsPath()
 	if runtime.GOOS == "windows" || os.Geteuid() == 0 {

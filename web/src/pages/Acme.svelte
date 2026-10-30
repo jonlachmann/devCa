@@ -78,7 +78,7 @@
     <h2>Test the ACME workflow</h2>
     <p class="small muted">Runs a real issuance against DevCA with an independent ACME client: account, order, HTTP-01 challenge served by DevCA's gateway, finalize, chain check, revoke.</p>
     <div class="actions">
-      <input type="text" bind:value={testHost} placeholder="api.localhost" required style="max-width:20rem" />
+      <input type="text" bind:value={testHost} placeholder="api.localhost" aria-label="Hostname to test" required style="max-width:20rem" />
       <button class="btn primary" disabled={testing}>{testing ? 'Running…' : 'Run test'}</button>
     </div>
     {#if result}

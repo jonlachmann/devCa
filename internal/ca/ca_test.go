@@ -43,7 +43,7 @@ func TestCheckName(t *testing.T) {
 	c := newCA(t)
 	ok := []string{"api.localhost", "a.b.local", "localhost", "127.0.0.1", "::1", "xn--bcher-kva.local"}
 	bad := []string{"local", "google.com", "api.local.com", "API.local", "-a.local", "a..local",
-		"10.0.0.1", "*.local", "*.localhost", "a_b.local", "api.local.", ""}
+		"10.0.0.1", "::1%lo0", "::ffff:127.0.0.1", "*.local", "*.localhost", "a_b.local", "api.local.", ""}
 	for _, n := range ok {
 		if err := c.CheckName(n, false); err != nil {
 			t.Errorf("%q rejected: %v", n, err)

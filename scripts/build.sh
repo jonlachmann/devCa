@@ -20,7 +20,7 @@ for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64 wi
   echo "building $os/$arch"
   CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -buildvcs=false \
     -ldflags "-s -w -buildid= -X main.version=$VERSION" \
-    -o "$OUT/devca-$VERSION-$os-$arch$ext" ./cmd/devca
+    -o "$OUT/devca-$os-$arch$ext" ./cmd/devca
 done
-(cd "$OUT" && shasum -a 256 devca-"$VERSION"-* > SHA256SUMS)
-echo "done: $OUT/"
+(cd "$OUT" && shasum -a 256 devca-* > SHA256SUMS)
+echo "done: $OUT/ (version $VERSION)"

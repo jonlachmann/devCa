@@ -165,7 +165,7 @@ Pattern: the command runs unprivileged, shows exactly what will change, and asks
 - **Background service:**
   - macOS: LaunchAgent, which runs as the user.
   - Linux: a systemd system unit with `User=<you>` + `AmbientCapabilities=CAP_NET_BIND_SERVICE`.
-  - Windows: a Task Scheduler ONLOGON task as the user. `devca install` sets it up and `devca uninstall` removes only the service, then prints how to untrust the CA and where the data lives.
+  - Windows: a Task Scheduler ONLOGON task as the user. *Impl: replaced by a per-user `HKCU\…\Run` entry, since creating logon tasks usually needs admin rights.* `devca install` sets it up and `devca uninstall` removes only the service, then prints how to untrust the CA and where the data lives.
 
 ## 10. CLI (stdlib `flag`)
 

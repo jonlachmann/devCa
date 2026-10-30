@@ -8,8 +8,8 @@
   let restart = $state(false)
 
   $effect(() => {
-    api<{ settings: Settings; suffixes: string[]; dataDir: string }>('GET', '/api/settings').then(
-      (r) => ((form = r.settings), (suffixes = r.suffixes), (dataDir = r.dataDir)),
+    api<{ settings: Settings; suffixes: string[]; dataDir: string; restartRequired: boolean }>('GET', '/api/settings').then(
+      (r) => ((form = r.settings), (suffixes = r.suffixes), (dataDir = r.dataDir), (restart = r.restartRequired)),
       (e) => notify(e.message, 'error'),
     )
   })

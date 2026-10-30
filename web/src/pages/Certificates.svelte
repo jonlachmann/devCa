@@ -9,7 +9,14 @@
 
   const certs = resource<Cert[]>('/api/certs', 5000)
   let showAll = $state(false)
-  let selectedId = $state<number | null>(Number(location.hash.split('?')[1]) || null)
+  const fromHash = () => Number(location.hash.split('?')[1]) || null
+  let selectedId = $state<number | null>(fromHash())
+  // #/certificates?12 -> ?15 doesn't remount the page, so follow the hash.
+  $effect(() => {
+    const on = () => (selectedId = fromHash())
+    addEventListener('hashchange', on)
+    return () => removeEventListener('hashchange', on)
+  })
   let detail = $state<Cert | null>(null)
 
   const isHistory = (c: Cert) =>
@@ -22,7 +29,12 @@
       detail = null
       return
     }
-    api<Cert>('GET', `/api/certs/${selectedId}`).then((c) => (detail = c), () => (detail = null))
+    const want = selectedId
+    // Ignore a slower response for a previously selected row.
+    api<Cert>('GET', `/api/certs/${want}`).then(
+      (c) => selectedId === want && (detail = c),
+      () => selectedId === want && (detail = null),
+    )
   })
 
   const tone = (s: Cert['status']) => (s === 'valid' ? 'ok' : s === 'expiring' ? 'warn' : 'bad')
@@ -90,7 +102,7 @@
         <tbody>
           {#each list as c (c.id)}
             <tr class="clickable" class:selected={c.id === selectedId} onclick={() => (selectedId = c.id)}>
-              <td><strong>{c.names.join(', ')}</strong></td>
+              <td><button class="row-link" onclick={() => (selectedId = c.id)}>{c.names.join(', ')}</button></td>
               <td><Badge tone={tone(c.status)}>{c.status}</Badge></td>
               <td>{date(c.notAfter)}</td>
               <td class="muted">{c.ownerLabel}</td>
@@ -107,5 +119,6 @@
 
 <style>
   tr.selected td { background: var(--accent-soft); }
+  .row-link { font: inherit; font-weight: 600; color: inherit; background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
   details summary { cursor: pointer; margin-bottom: .5rem; }
 </style>
