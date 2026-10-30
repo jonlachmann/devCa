@@ -1,14 +1,26 @@
 # Pushing a tag like v1.2.3 builds all platforms with scripts/build.sh (which
 # also runs svelte-check, go vet and go test) and publishes a GitHub release.
 # Tags with a hyphen (v1.2.3-rc.1) become pre-releases.
+#
+# To (re)publish an existing tag with the current version of this workflow,
+# run it manually from the Actions tab and enter the tag. Re-running an old
+# run would use the workflow file as it was at that tag.
 name: Release
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish, e.g. v0.1.0
+        required: true
 
 permissions:
   contents: write # create the release and upload assets
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -16,6 +28,8 @@ jobs:
     steps:
       # Actions are pinned to commit SHAs so a moved tag can't change the build.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -30,13 +44,33 @@ jobs:
       - name: Build
         run: scripts/build.sh
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ env.TAG }}
 
+      # GitHub's API occasionally fails with 5xx, most often while generating
+      # release notes. Creating the release and uploading files are separate,
+      # retried steps, and both are safe to repeat.
       - name: Publish release
         run: |
-          flags="--generate-notes --verify-tag"
-          case "$TAG" in *-*) flags="$flags --prerelease" ;; esac
-          gh release create "$TAG" dist/devca-* dist/SHA256SUMS --title "DevCA $TAG" $flags
+          set -euo pipefail
+          flags=(--title "DevCA $TAG" --verify-tag)
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+
+          retry() {
+            for i in 1 2 3; do
+              "$@" && return 0
+              echo "::warning::attempt $i of: $* failed"
+              sleep $((i * 15))
+            done
+            return 1
+          }
+          exists() { gh release view "$TAG" >/dev/null 2>&1; }
+          create() { exists || gh release create "$TAG" "${flags[@]}" "$@"; }
+
+          if ! retry create --generate-notes; then
+            echo "::warning::GitHub could not generate release notes; publishing without them"
+            retry create --notes "Release $TAG"
+          fi
+          retry gh release upload "$TAG" dist/devca-* dist/SHA256SUMS --clobber
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
