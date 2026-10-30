@@ -24,14 +24,14 @@ Services:
   devca proxy add <host> <target>    HTTPS proxy, e.g. devca proxy add api.localhost 3000
   devca proxy list
   devca proxy remove <host>
-  devca cert issue <host> [--out dir] [--address 127.0.0.x]
+  devca cert issue <host> [--out dir] [--address 127.0.0.x] [--forward port]
                                      certificate files for an app that does its own TLS
   devca cert list
   devca cert renew <host>
   devca cert revoke <host|id>
   devca cert export <host> --out dir
   devca acme info                    ACME directory URL and accounts
-  devca acme claim <host> [--port n] [--address 127.0.0.x]
+  devca acme claim <host> [--port n] [--address 127.0.0.x] [--forward port]
                                      reserve a host for an external ACME client
   devca test acme <host>             run a full ACME issuance against DevCA
 

@@ -57,6 +57,7 @@ export type Service = {
   exportDir?: string
   validationPort?: number
   address?: string
+  passthrough?: string
   enabled: boolean
   autoRenew: boolean
   url?: string

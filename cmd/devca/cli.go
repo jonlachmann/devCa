@@ -88,6 +88,9 @@ func (c *client) upsert(host string, body map[string]any) (svcView, error) {
 		if body["validationPort"] == 0 {
 			body["validationPort"] = cur.ValidationPort
 		}
+		if body["passthrough"] == "" {
+			body["passthrough"] = cur.Passthrough
+		}
 	}
 	err = c.do("PUT", "/api/services/"+host, body, &v)
 	return v, err
@@ -100,6 +103,7 @@ type svcView struct {
 	Address        string
 	ExportDir      string
 	ValidationPort int
+	Passthrough    string
 	Mode           string
 	Target         string
 	Enabled        bool
@@ -277,6 +281,7 @@ func cmdCertIssue(args []string) error {
 	fs, data := flags("cert issue")
 	out := fs.String("out", "", "also write the files to this directory (kept up to date on renewal)")
 	addr := fs.String("address", "", "loopback address for the hosts file, e.g. 127.0.0.2 (to share a port with another service)")
+	forward := fs.String("forward", "", "forward https://<host> on port 443, still encrypted, to your app's own TLS port, e.g. 8443")
 	pos := parse(fs, args)
 	if err := need(pos, 1, "cert issue <host> [--out dir]"); err != nil {
 		return err
@@ -289,7 +294,7 @@ func cmdCertIssue(args []string) error {
 		}
 	}
 	c := newClient(*data)
-	body := map[string]any{"hostname": pos[0], "mode": "export", "exportDir": dir}
+	body := map[string]any{"hostname": pos[0], "mode": "export", "exportDir": dir, "passthrough": *forward}
 	if *addr != "" {
 		body["address"] = *addr
 	}
@@ -300,6 +305,9 @@ func cmdCertIssue(args []string) error {
 	fmt.Printf("Certificate for %s, renewed automatically:\n", v.Hostname)
 	if v.Address != "" {
 		fmt.Printf("Hosts entry: %s %s (bind your app to that address)\n", v.Address, v.Hostname)
+	}
+	if v.Passthrough != "" {
+		fmt.Printf("%s is forwarded, still encrypted, to %s\n", v.URL, v.Passthrough)
 	}
 	for _, d := range []string{v.CertDir, dir} {
 		if d == "" {
@@ -424,19 +432,24 @@ func cmdACMEClaim(args []string) error {
 	fs, data := flags("acme claim")
 	port := fs.Int("port", 0, "port where your ACME client serves HTTP-01 (if DevCA's gateway holds port 80)")
 	addr := fs.String("address", "", "loopback address for the hosts file and HTTP-01 validation, e.g. 127.0.0.2")
+	forward := fs.String("forward", "", "forward https://<host> on port 443, still encrypted, to your app's own TLS port, e.g. 8443")
 	pos := parse(fs, args)
 	if err := need(pos, 1, "acme claim <host> [--port n]"); err != nil {
 		return err
 	}
 	c := newClient(*data)
-	body := map[string]any{"hostname": pos[0], "mode": "acme", "validationPort": *port}
+	body := map[string]any{"hostname": pos[0], "mode": "acme", "validationPort": *port, "passthrough": *forward}
 	if *addr != "" {
 		body["address"] = *addr
 	}
-	if _, err := c.upsert(pos[0], body); err != nil {
+	v, err := c.upsert(pos[0], body)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("%s is reserved for an external ACME client. DevCA will not issue or renew it itself.\n", pos[0])
+	fmt.Printf("%s is reserved for an external ACME client. DevCA will not issue or renew it itself.\n", v.Hostname)
+	if v.Passthrough != "" {
+		fmt.Printf("%s is forwarded, still encrypted, to %s\n", v.URL, v.Passthrough)
+	}
 	return nil
 }
 

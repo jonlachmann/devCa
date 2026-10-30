@@ -12,7 +12,7 @@
   let suffix = $derived(settings.data?.settings.defaultSuffix ?? 'localhost')
 
   let adding = $state(location.hash.includes('?new'))
-  let form = $state({ hostname: '', mode: 'proxy' as Mode, target: '', exportDir: '', validationPort: '', address: '' })
+  let form = $state({ hostname: '', mode: 'proxy' as Mode, target: '', exportDir: '', validationPort: '', address: '', passthrough: '' })
   let busy = $state(false)
   let expanded = $state<string | null>(null)
 
@@ -40,13 +40,14 @@
           exportDir: form.exportDir,
           validationPort: Number(form.validationPort) || 0,
           address: form.mode === 'proxy' ? '' : form.address,
+          passthrough: form.mode === 'proxy' ? '' : form.passthrough,
         }),
       `Added ${fullHost(form.hostname)}`,
     )
     busy = false
     if (ok) {
       expanded = fullHost(form.hostname)
-      form = { hostname: '', mode: form.mode, target: '', exportDir: '', validationPort: '', address: '' }
+      form = { hostname: '', mode: form.mode, target: '', exportDir: '', validationPort: '', address: '', passthrough: '' }
       adding = false
       services.reload()
     }
@@ -65,6 +66,7 @@
         exportDir: next.exportDir ?? '',
         validationPort: next.validationPort ?? 0,
         address: next.address ?? '',
+        passthrough: next.passthrough ?? '',
         enabled: next.enabled,
         autoRenew: next.autoRenew,
       }),
@@ -153,6 +155,11 @@
     {/if}
     {#if form.mode !== 'proxy'}
       <div class="field">
+        <label for="fwd">Forward <code>https://{fullHost(form.hostname) || `app.${suffix}`}</code> to your app <span class="muted">(optional)</span></label>
+        <input id="fwd" type="text" bind:value={form.passthrough} placeholder="8443" autocomplete="off" />
+        <div class="hint">The port where your app serves HTTPS itself. DevCA passes connections on port 443 straight through, still encrypted, so your app's own certificate is used.</div>
+      </div>
+      <div class="field">
         <label for="addr">Loopback address <span class="muted">(optional)</span></label>
         <input id="addr" type="text" bind:value={form.address} placeholder="127.0.0.1" autocomplete="off" spellcheck="false" />
         <div class="hint">Give this hostname its own address, e.g. <code>127.0.0.2</code>, so its app can use the same port as another service. Used for the hosts file; bind your app to it.</div>
@@ -182,12 +189,12 @@
       {#if v.address}<span class="muted small mono">{v.address}</span>{/if}
       {#if !v.enabled}<Badge>disabled</Badge>{/if}
       <span class="spacer"></span>
-      {#if v.mode === 'proxy'}
+      {#if v.mode === 'proxy' || v.passthrough}
         <span class="small">
           {#if v.health}
             <span class="dot" class:ok={v.health.up} class:bad={!v.health.up}></span>{v.health.up ? 'app is up' : 'app is down'}
           {/if}
-          <span class="muted">→ {v.target}</span>
+          <span class="muted">→ {v.mode === 'proxy' ? v.target : `${v.passthrough} (passthrough)`}</span>
         </span>
       {/if}
       {#if v.cert}
@@ -226,6 +233,10 @@
           {#if v.exportDir}<Code text={v.exportDir} />{/if}
         {/if}
         {#if v.mode !== 'proxy'}
+          <div class="field inline">
+            <label for={'p-' + v.hostname}>Forward HTTPS on port 443 to</label>
+            <input id={'p-' + v.hostname} type="text" value={v.passthrough ?? ''} placeholder="e.g. 8443 (optional)" onchange={(e) => update(v, { passthrough: e.currentTarget.value })} />
+          </div>
           <div class="field inline">
             <label for={'a-' + v.hostname}>Loopback address</label>
             <input id={'a-' + v.hostname} type="text" value={v.address ?? ''} placeholder="127.0.0.1" onchange={(e) => update(v, { address: e.currentTarget.value })} />

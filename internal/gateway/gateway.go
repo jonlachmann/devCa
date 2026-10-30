@@ -27,9 +27,11 @@ import (
 )
 
 type route struct {
-	svc   store.Service
-	proxy *httputil.ReverseProxy
-	cert  *tls.Certificate
+	svc         store.Service
+	proxy       *httputil.ReverseProxy // proxy mode
+	cert        *tls.Certificate       // proxy mode
+	passthrough string                 // host:port of the app's own TLS listener
+	dial        string                 // host:port used for health checks
 }
 
 type Listener struct {
@@ -139,18 +141,22 @@ func (g *Gateway) Reload() {
 	var svcs []store.Service
 	g.Store.View(func(s *store.State) {
 		for _, v := range s.Services {
-			if v.Enabled && v.Mode == store.ModeProxy {
+			if v.Enabled && (v.Mode == store.ModeProxy || v.Passthrough != "") {
 				svcs = append(svcs, *v)
 			}
 		}
 	})
 	routes := map[string]*route{}
 	for _, svc := range svcs {
+		if svc.Mode != store.ModeProxy {
+			routes[svc.Hostname] = &route{svc: svc, passthrough: svc.Passthrough, dial: svc.Passthrough}
+			continue
+		}
 		target, err := url.Parse(svc.Target)
 		if err != nil {
 			continue
 		}
-		rt := &route{svc: svc, proxy: g.newProxy(svc.Hostname, target)}
+		rt := &route{svc: svc, proxy: g.newProxy(svc.Hostname, target), dial: target.Host}
 		if c, err := g.Certs.TLSCertificate(svc.Hostname); err == nil {
 			rt.cert = c
 		}
@@ -227,7 +233,7 @@ func (g *Gateway) HTTPHandler() http.Handler {
 func (g *Gateway) HTTPSHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rt := g.lookup(r.Host)
-		if rt == nil {
+		if rt == nil || rt.proxy == nil { // passthrough hosts never get here with SNI
 			unknownHost(w, r.Host)
 			return
 		}
@@ -280,7 +286,7 @@ func (g *Gateway) Serve(ctx context.Context, httpPort, httpsPort int) {
 		for _, ln := range lns {
 			srv := &http.Server{Handler: l.h, ReadHeaderTimeout: 10 * time.Second}
 			if l.tls {
-				ln = tls.NewListener(ln, tlsCfg)
+				ln = tls.NewListener(newSNIListener(ln, g), tlsCfg)
 			}
 			servers = append(servers, srv)
 			go func() {
@@ -376,17 +382,16 @@ func (g *Gateway) checkHealth() {
 	g.mu.RLock()
 	targets := map[string]string{}
 	for h, rt := range g.routes {
-		targets[h] = rt.svc.Target
+		targets[h] = rt.dial
 	}
 	g.mu.RUnlock()
 	res := map[string]Health{}
-	for h, t := range targets {
-		u, _ := url.Parse(t)
+	for h, addr := range targets {
 		d := net.Dialer{Timeout: time.Second, Control: loopbackOnly}
-		c, err := d.Dial("tcp", u.Host)
+		c, err := d.Dial("tcp", addr)
 		hl := Health{Up: err == nil, Checked: time.Now()}
 		if err != nil {
-			hl.Error = fmt.Sprintf("nothing is listening on %s", u.Host)
+			hl.Error = fmt.Sprintf("nothing is listening on %s", addr)
 		} else {
 			c.Close()
 		}

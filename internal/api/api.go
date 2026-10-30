@@ -248,7 +248,7 @@ func (a *API) serviceViews() []serviceView {
 			if h, ok := health[svc.Hostname]; ok {
 				v.Health = &h
 			}
-			if svc.Mode == store.ModeProxy {
+			if svc.Mode == store.ModeProxy || svc.Passthrough != "" {
 				v.URL = "https://" + svc.Hostname
 				if a.HTTPSPort != 443 {
 					v.URL += ":" + strconv.Itoa(a.HTTPSPort)
@@ -274,6 +274,7 @@ type serviceInput struct {
 	Target         string  `json:"target"`
 	ExportDir      string  `json:"exportDir"`
 	ValidationPort int     `json:"validationPort"`
+	Passthrough    string  `json:"passthrough"`
 	Address        *string `json:"address"` // nil keeps the current value
 	Enabled        *bool   `json:"enabled"`
 	AutoRenew      *bool   `json:"autoRenew"`
@@ -287,7 +288,14 @@ func (a *API) apply(svc *store.Service, in serviceInput) error {
 		return bad("mode must be proxy, export or acme")
 	}
 	svc.Mode = in.Mode
-	svc.Target, svc.ExportDir, svc.ValidationPort = "", "", 0
+	svc.Target, svc.ExportDir, svc.ValidationPort, svc.Passthrough = "", "", 0, ""
+	if in.Mode != store.ModeProxy && strings.TrimSpace(in.Passthrough) != "" {
+		t, err := gateway.ParseTarget(in.Passthrough, a.MgmtPort, a.ACMEPort, a.HTTPPort, a.HTTPSPort)
+		if err != nil {
+			return bad("forward target: %v", err)
+		}
+		svc.Passthrough = strings.SplitN(t, "://", 2)[1] // raw TCP: the scheme is meaningless
+	}
 	switch in.Mode {
 	case store.ModeProxy:
 		t, err := gateway.ParseTarget(in.Target, a.MgmtPort, a.ACMEPort, a.HTTPPort, a.HTTPSPort)
@@ -320,6 +328,9 @@ func (a *API) apply(svc *store.Service, in serviceInput) error {
 	}
 	if svc.Mode == store.ModeProxy && svc.Address != "" {
 		return bad("proxy services are reached through the gateway on 127.0.0.1; clear the loopback address first")
+	}
+	if svc.Passthrough != "" && svc.Address != "" {
+		return bad("forwarding through the gateway needs the hostname on 127.0.0.1; clear the loopback address or the forward target")
 	}
 	if in.Enabled != nil {
 		svc.Enabled = *in.Enabled

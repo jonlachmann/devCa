@@ -48,6 +48,7 @@ type Service struct {
 	ExportDir      string    `json:"exportDir,omitempty"`      // extra export location (export mode)
 	ValidationPort int       `json:"validationPort,omitempty"` // acme mode: where HTTP-01 is checked
 	Address        string    `json:"address,omitempty"`        // loopback IP for the hosts file; "" = 127.0.0.1 and ::1
+	Passthrough    string    `json:"passthrough,omitempty"`    // export/acme: forward TLS on :443 untouched to this host:port
 	Enabled        bool      `json:"enabled"`
 	AutoRenew      bool      `json:"autoRenew"`
 	CertID         int64     `json:"certId,omitempty"`

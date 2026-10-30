@@ -3,7 +3,11 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jonlachmann/devca/internal/ca"
 	"github.com/jonlachmann/devca/internal/certs"
@@ -191,5 +196,74 @@ func TestLoopbackListener(t *testing.T) {
 	c.Close()
 	if a := <-accepted; !a.(*net.TCPAddr).IP.IsLoopback() {
 		t.Fatalf("accepted %v", a)
+	}
+}
+
+func TestTLSPassthrough(t *testing.T) {
+	// The proxied app (api.localhost) and an app doing its own TLS (app.localhost).
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "proxied") }))
+	defer plain.Close()
+	g := newGateway(t, plain.URL)
+
+	appKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	appLeaf, err := g.Certs.CA.Issue([]string{"app.localhost"}, appKey.Public(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "app's own TLS") }))
+	app.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{appLeaf.Raw}, PrivateKey: appKey}}}
+	app.StartTLS()
+	defer app.Close()
+	_ = g.Store.Update(func(s *store.State) error {
+		s.Services = append(s.Services, &store.Service{Hostname: "app.localhost", Mode: store.ModeACME, Enabled: true,
+			Passthrough: app.Listener.Addr().String()})
+		return nil
+	})
+	g.Reload()
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	srv := &http.Server{Handler: g.HTTPSHandler()}
+	go srv.Serve(tls.NewListener(newSNIListener(ln, g), &tls.Config{GetCertificate: g.GetCertificate}))
+	defer srv.Close()
+	addr := ln.Addr().String()
+
+	get := func(host string) (string, *x509.Certificate, error) {
+		c := &http.Client{Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: g.Certs.CA.Pool()},
+			DialContext:     func(context.Context, string, string) (net.Conn, error) { return net.Dial("tcp", addr) },
+		}}
+		resp, err := c.Get("https://" + host + "/")
+		if err != nil {
+			return "", nil, err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return string(b), resp.TLS.PeerCertificates[0], nil
+	}
+
+	body, peer, err := get("app.localhost")
+	if err != nil || body != "app's own TLS" {
+		t.Fatalf("passthrough: %q %v", body, err)
+	}
+	if !peer.Equal(appLeaf) {
+		t.Fatal("client did not see the app's own certificate")
+	}
+	// The replayed ClientHello still works for DevCA-terminated hosts.
+	if body, _, err := get("api.localhost"); err != nil || body != "proxied" {
+		t.Fatalf("proxy on same listener: %q %v", body, err)
+	}
+	if _, _, err := get("other.localhost"); err == nil {
+		t.Fatal("unknown host accepted")
+	}
+	// Port 80 redirects passthrough hosts too.
+	w := httptest.NewRecorder()
+	g.HTTPHandler().ServeHTTP(w, httptest.NewRequest("GET", "http://app.localhost/x", nil))
+	if w.Code != 308 {
+		t.Fatalf("redirect: %d", w.Code)
+	}
+	// App down: the connection is closed instead of falling back to DevCA.
+	app.Close()
+	if _, _, err := get("app.localhost"); err == nil {
+		t.Fatal("expected failure with the app down")
 	}
 }

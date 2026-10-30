@@ -100,6 +100,24 @@ On macOS the data dir is `~/Library/Application Support/devca`. `devca ca info` 
 
 **Tested clients:** `golang.org/x/crypto/acme`, which is used in the test suite, and lego v4 (issue, renew, revoke). certbot, acme.sh and Caddy should work, since only standard RFC 8555 is used, but haven't been tested yet.
 
+### Forwarding HTTPS to an app that does its own TLS
+
+A Files or ACME client service normally serves HTTPS on its own port, e.g. `https://app.localhost:8443`. To reach it on the standard port instead, let the gateway forward it:
+
+```sh
+devca cert issue app.localhost --out ./certs --forward 8443   # or: devca acme claim app.localhost --forward 8443
+```
+
+Now `https://app.localhost` works.
+- **The traffic stays encrypted.** The gateway reads only the hostname the client sends at the start of the TLS handshake (SNI). It then passes the connection, still encrypted, to `localhost:8443`, so your app's own certificate is used and DevCA never decrypts anything.
+- **Port 80 redirects to HTTPS** for these hosts too.
+- **Forward targets follow the proxy rules:** they must be on this machine and can't be DevCA's own ports.
+- **Your app sees connections from `127.0.0.1`.** There's no `X-Forwarded-For`, because headers can't be added to encrypted traffic.
+- **Clients must send the hostname.** One connecting to `https://127.0.0.1` reaches DevCA's gateway instead.
+- **Can't be combined with a custom loopback address,** since the hostname has to point at the gateway.
+
+In the UI this is the optional "Forward HTTPS" field on Files and ACME client services.
+
 ## Hostnames, `.localhost`, `.local` and mDNS
 
 DevCA allows names ending in **`.localhost`** (the default) and **`.local`**.
@@ -264,6 +282,6 @@ These are deliberately left out:
 - **CRL/OCSP:** browsers don't check them for local roots, so revocation takes effect in DevCA itself.
 - **mDNS publishing.**
 - **Remote management.**
-- **HTTP/2 on the gateway:** it speaks HTTP/1.1 to browsers, which is fine for development, and WebSockets work.
+- **HTTP/2 on the gateway:** proxied services get HTTP/1.1, which is fine for development, and WebSockets work. Forwarded (passthrough) services negotiate HTTP/2 directly with the app.
 
 Platform testing: the platform-specific code (trust store, hosts file, background service) has only been run on macOS so far. Linux and Windows builds compile and pass the unit tests.

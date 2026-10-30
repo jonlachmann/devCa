@@ -116,3 +116,28 @@ func TestServiceAddress(t *testing.T) {
 		t.Fatalf("127.0.0.1 not normalized: %s", w.Body)
 	}
 }
+
+func TestServicePassthrough(t *testing.T) {
+	h := newAPI(t)
+	post := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "http://127.0.0.1:7171/api/services", strings.NewReader(body))
+		r.Header.Set("X-DevCA", "1")
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	for _, body := range []string{
+		`{"hostname":"a.localhost","mode":"acme","passthrough":"10.0.0.1:443"}`,
+		`{"hostname":"a.localhost","mode":"acme","passthrough":"443"}`,
+		`{"hostname":"a.localhost","mode":"acme","passthrough":"8443","address":"127.0.0.2"}`,
+	} {
+		if w := post(body); w.Code != 400 {
+			t.Errorf("%s: got %d %s", body, w.Code, w.Body)
+		}
+	}
+	if w := post(`{"hostname":"a.localhost","mode":"acme","passthrough":"8443"}`); w.Code != 200 ||
+		!strings.Contains(w.Body.String(), `"passthrough":"localhost:8443"`) || !strings.Contains(w.Body.String(), `"url":"https://a.localhost"`) {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+}
