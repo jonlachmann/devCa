@@ -1,0 +1,7 @@
+/dist/
+web/node_modules/
+web/dist/ui/
+.idea/
+
+# Project exclude paths
+/web/dist/
